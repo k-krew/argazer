@@ -6,6 +6,34 @@
 
 **Argazer** (a wordplay on "Argo" and "gazer") is a lightweight tool that monitors your ArgoCD applications for Helm chart updates. It connects to ArgoCD via API, scans your applications, and notifies you when newer versions are available.
 
+## Example
+
+```bash
+$ argazer
+
+================================================================================
+ARGAZER SCAN RESULTS
+================================================================================
+
+Total applications checked: 15
+
+Up to date: 11
+Updates available: 4
+Skipped: 0
+
+--------------------------------------------------------------------------------
+APPLICATIONS WITH UPDATES AVAILABLE:
+--------------------------------------------------------------------------------
+
+Application: cert-manager
+  Project: internal
+  Chart: cert-manager
+  Current Version: 1.18.5
+  Latest Version: v1.20.0
+  Repository: https://charts.jetstack.io
+...
+```
+
 ## Features
 
 - **Single-run execution** - Runs once on launch, perfect for CI/CD or cron jobs
