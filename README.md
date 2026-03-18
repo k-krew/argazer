@@ -1261,7 +1261,7 @@ For applications with multiple Helm sources:
 
 ## License
 
-GPL-3.0 license
+Apache 2.0 license
 
 ## Contributing
 
