@@ -67,21 +67,21 @@ func (f *MessageFormatter) formatSingleUpdate(update ApplicationUpdate) string {
 	var sb strings.Builder
 
 	// Compact format: app name as header with project
-	sb.WriteString(fmt.Sprintf("%s (%s)\n", update.AppName, update.Project))
-	sb.WriteString(fmt.Sprintf("  Chart: %s\n", update.ChartName))
-	sb.WriteString(fmt.Sprintf("  Version: %s -> %s\n", update.CurrentVersion, update.LatestVersion))
+	fmt.Fprintf(&sb, "%s (%s)\n", update.AppName, update.Project)
+	fmt.Fprintf(&sb, "  Chart: %s\n", update.ChartName)
+	fmt.Fprintf(&sb, "  Version: %s -> %s\n", update.CurrentVersion, update.LatestVersion)
 
 	// Show constraint if not "major" (default)
 	if update.ConstraintApplied != "major" && update.ConstraintApplied != "" {
-		sb.WriteString(fmt.Sprintf("  Constraint: %s\n", update.ConstraintApplied))
+		fmt.Fprintf(&sb, "  Constraint: %s\n", update.ConstraintApplied)
 	}
 
 	// Show note if updates exist outside constraint
 	if update.HasUpdateOutsideConstraint && update.LatestVersionAll != "" && update.LatestVersionAll != update.LatestVersion {
-		sb.WriteString(fmt.Sprintf("  Note: v%s available outside constraint\n", update.LatestVersionAll))
+		fmt.Fprintf(&sb, "  Note: v%s available outside constraint\n", update.LatestVersionAll)
 	}
 
-	sb.WriteString(fmt.Sprintf("  Repo: %s\n", update.RepoURL))
+	fmt.Fprintf(&sb, "  Repo: %s\n", update.RepoURL)
 	sb.WriteString("\n")
 
 	return sb.String()
