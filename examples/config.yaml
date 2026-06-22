@@ -62,7 +62,7 @@ teams_webhook: "https://outlook.office.com/webhook/YOUR/WEBHOOK/URL"
 webhook_url: "https://your-webhook-endpoint.example.com/notify"
 
 # General Settings
-verbose: false
+verbosity: "normal"  # "normal" | "full" | "off"
 source_name: "chart-repo"  # For multi-source applications
 concurrency: 10  # Number of concurrent workers for checking applications
 

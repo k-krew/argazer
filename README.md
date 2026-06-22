@@ -102,6 +102,10 @@ Control which updates trigger notifications based on semantic versioning:
 
 Argazer can be configured via a `config.yaml` file, CLI flags, or environment variables (`AG_` prefix).
 
+> **Note:** Full configuration examples can be found in the `examples/` directory:
+> - [`examples/config.yaml`](examples/config.yaml)
+> - [`examples/.env.example`](examples/.env.example)
+
 <details>
 <summary><b>Click to expand full configuration examples</b></summary>
 

@@ -37,9 +37,9 @@ ehthumbs.db
 Thumbs.db
 
 # Configuration files with secrets
-config.yaml
-config_bkp.yaml
-.env
+/config.yaml
+/config_bkp.yaml
+/.env
 
 # Log files
 *.log
