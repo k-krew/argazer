@@ -20,6 +20,14 @@
 
 ## Installation
 
+### Homebrew (macOS / Linux)
+
+```bash
+brew tap k-krew/tap https://github.com/k-krew/homebrew-tap.git
+brew trust k-krew/tap
+brew install --cask argazer
+```
+
 ### Using Docker
 
 Multi-architecture images are available for **AMD64** and **ARM64**:
@@ -39,8 +47,6 @@ git clone git@github.com:kreicer/argazer.git
 cd argazer
 go build -o argazer .
 ```
-
-*(Note: Homebrew support is coming soon!)*
 
 ## Quick Start
 

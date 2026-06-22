@@ -42,8 +42,8 @@ WORKDIR /app
 # Copy binary from builder stage
 COPY --from=builder /build/argazer .
 
-# Copy example config (optional)
-COPY --from=builder /build/config.yaml.example .
+# Copy example configs
+COPY --from=builder /build/examples/ ./examples/
 
 # Change ownership to non-root user
 RUN chown -R argazer:argazer /app
