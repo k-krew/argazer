@@ -49,7 +49,3 @@ tmp/
 temp/
 
 .work/
-
-# Release notes files
-RELEASE_NOTES_*.md
-TEST_*.md
