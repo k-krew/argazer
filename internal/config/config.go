@@ -27,6 +27,13 @@ const (
 	LogFormatText = "text"
 )
 
+// Verbosity level constants
+const (
+	VerbosityFull   = "full"   // All logs including debug
+	VerbosityNormal = "normal" // Only necessary logs (info and above)
+	VerbosityOff    = "off"    // No logs, only result output
+)
+
 // Config holds the application configuration
 type Config struct {
 	// ArgoCD connection settings
@@ -66,7 +73,7 @@ type Config struct {
 	WebhookURL string `mapstructure:"webhook_url"`
 
 	// General settings
-	Verbose           bool   `mapstructure:"verbose"`
+	Verbosity         string `mapstructure:"verbosity"`
 	LogFormat         string `mapstructure:"log_format"`         // Log format: "json" or "text" (default: "json")
 	SourceName        string `mapstructure:"source_name"`        // Name of the source to check in multi-source applications
 	Concurrency       int    `mapstructure:"concurrency"`        // Number of concurrent workers for checking applications
@@ -110,7 +117,7 @@ func Load() (*Config, error) {
 // setDefaults sets default values for all configuration fields
 func setDefaults() {
 	// Boolean and numeric defaults
-	viper.SetDefault("verbose", false)
+	viper.SetDefault("verbosity", VerbosityNormal)
 	viper.SetDefault("argocd_insecure", false)
 	viper.SetDefault("email_smtp_port", 587)
 	viper.SetDefault("email_use_tls", true)
@@ -250,6 +257,14 @@ func validateConfig(cfg *Config) error {
 	// Normalize empty to "json"
 	if cfg.LogFormat == "" {
 		cfg.LogFormat = LogFormatJSON
+	}
+
+	// Validate verbosity
+	if cfg.Verbosity != "" && cfg.Verbosity != VerbosityFull && cfg.Verbosity != VerbosityNormal && cfg.Verbosity != VerbosityOff {
+		return fmt.Errorf("verbosity must be one of: '%s', '%s', '%s' (got: '%s')", VerbosityFull, VerbosityNormal, VerbosityOff, cfg.Verbosity)
+	}
+	if cfg.Verbosity == "" {
+		cfg.Verbosity = VerbosityNormal
 	}
 
 	// Validate notification channel settings

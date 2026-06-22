@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"io"
+	"os"
 	"testing"
 
 	"argazer/internal/config"
@@ -16,20 +17,29 @@ import (
 )
 
 func TestSetupLogging(t *testing.T) {
-	t.Run("verbose mode with JSON", func(t *testing.T) {
-		logger := setupLogging(true, "json")
+	t.Run("full verbosity with JSON", func(t *testing.T) {
+		logrus.SetOutput(os.Stderr)
+		logger := setupLogging("full", "json")
 		require.NotNil(t, logger)
 		assert.Equal(t, logrus.DebugLevel, logrus.GetLevel())
 	})
 
-	t.Run("normal mode with JSON", func(t *testing.T) {
-		logger := setupLogging(false, "json")
+	t.Run("normal verbosity with JSON", func(t *testing.T) {
+		logrus.SetOutput(os.Stderr)
+		logger := setupLogging("normal", "json")
 		require.NotNil(t, logger)
 		assert.Equal(t, logrus.InfoLevel, logrus.GetLevel())
 	})
 
+	t.Run("off verbosity", func(t *testing.T) {
+		logger := setupLogging("off", "json")
+		require.NotNil(t, logger)
+		assert.Equal(t, logrus.StandardLogger().Out, io.Discard)
+	})
+
 	t.Run("text format", func(t *testing.T) {
-		logger := setupLogging(false, "text")
+		logrus.SetOutput(os.Stderr)
+		logger := setupLogging("normal", "text")
 		require.NotNil(t, logger)
 		assert.Equal(t, logrus.InfoLevel, logrus.GetLevel())
 	})

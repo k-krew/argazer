@@ -63,7 +63,7 @@ It can filter by projects, application names, and labels, and send notifications
 	rootCmd.Flags().String("version-constraint", "major", "Version constraint: 'major' (all), 'minor' (same major), 'patch' (same major.minor)")
 	rootCmd.Flags().StringP("output-format", "o", "table", "Output format: 'table', 'json', or 'markdown'")
 	rootCmd.Flags().StringP("log-format", "l", "json", "Log format: 'json' or 'text'")
-	rootCmd.Flags().BoolP("verbose", "v", false, "Enable verbose logging")
+	rootCmd.Flags().StringP("verbosity", "v", "normal", "Verbosity level: 'full' (all logs), 'normal' (necessary logs), 'off' (only results)")
 
 	// Bind flags to viper
 	if err := viper.BindPFlags(rootCmd.Flags()); err != nil {
@@ -83,7 +83,7 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Set up logging
-	logger := setupLogging(cfg.Verbose, cfg.LogFormat)
+	logger := setupLogging(cfg.Verbosity, cfg.LogFormat)
 
 	logger.WithFields(logrus.Fields{
 		"argocd_url":   cfg.ArgocdURL,
@@ -741,10 +741,13 @@ func sendNotifications(ctx context.Context, notifier notification.Notifier, resu
 }
 
 // setupLogging configures the logging system
-func setupLogging(verbose bool, format string) *logrus.Entry {
-	if verbose {
+func setupLogging(verbosity string, format string) *logrus.Entry {
+	switch verbosity {
+	case config.VerbosityFull:
 		logrus.SetLevel(logrus.DebugLevel)
-	} else {
+	case config.VerbosityOff:
+		logrus.SetOutput(io.Discard)
+	default:
 		logrus.SetLevel(logrus.InfoLevel)
 	}
 
