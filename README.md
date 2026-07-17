@@ -6,6 +6,8 @@
 
 **Argazer** (a wordplay on "Argo" and "gazer") is a lightweight tool that monitors your ArgoCD applications for Helm chart updates. It connects to ArgoCD via API, scans your applications across multiple repository types (Git, OCI, HTTP), and notifies you when newer versions are available.
 
+![Argazer Demo](assets/demo.gif)
+
 ## Features
 
 - **Single-run execution** - Runs once on launch, perfect for CI/CD or cron jobs.
