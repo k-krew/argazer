@@ -3,7 +3,9 @@ package argocd
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/argoproj/argo-cd/v2/pkg/apiclient/repository"
 	reposerver "github.com/argoproj/argo-cd/v2/reposerver/apiclient"
@@ -13,22 +15,71 @@ import (
 	"google.golang.org/grpc"
 )
 
-// stubHelmChartLister records the query ArgoCD receives and answers with a canned response.
+// stubHelmChartLister records the queries ArgoCD receives and answers with a canned
+// response.
 type stubHelmChartLister struct {
 	response *reposerver.HelmChartsResponse
 	err      error
 
+	// failOnlyFirstCall limits err to the very first call, so a test can check that a
+	// failure does not end up in the cache.
+	failOnlyFirstCall bool
+
+	// entered is signalled on entry of every call, and block holds a call until the
+	// test closes it. Together they let a test keep callers in flight.
+	entered chan struct{}
+	block   chan struct{}
+
+	mu        sync.Mutex
+	calls     int
 	lastQuery *repository.RepoQuery
+	queries   []*repository.RepoQuery
 }
 
 func (s *stubHelmChartLister) GetHelmCharts(_ context.Context, in *repository.RepoQuery, _ ...grpc.CallOption) (*reposerver.HelmChartsResponse, error) {
+	s.mu.Lock()
+	s.calls++
+	firstCall := s.calls == 1
 	s.lastQuery = in
+	s.queries = append(s.queries, in)
+	s.mu.Unlock()
 
-	if s.err != nil {
+	// A call never waits for the test to notice it, so that an unexpected extra call
+	// shows up as a failed assertion instead of a hanging test.
+	if s.entered != nil {
+		select {
+		case s.entered <- struct{}{}:
+		default:
+		}
+	}
+	if s.block != nil {
+		<-s.block
+	}
+
+	if s.err != nil && (!s.failOnlyFirstCall || firstCall) {
 		return nil, s.err
 	}
 
 	return s.response, nil
+}
+
+func (s *stubHelmChartLister) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.calls
+}
+
+func (s *stubHelmChartLister) projectsAsked() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	projects := make([]string, 0, len(s.queries))
+	for _, query := range s.queries {
+		projects = append(projects, query.AppProject)
+	}
+
+	return projects
 }
 
 func newTestClient(lister helmChartLister) *Client {
@@ -207,6 +258,184 @@ func TestGetHelmChartVersions_Error(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, listerErr)
 	assert.Contains(t, err.Error(), "https://charts.example.com")
+}
+
+// TestGetHelmChartVersions_AsksArgoCDOncePerRepository is the reason the cache exists:
+// every GetHelmCharts call makes the ArgoCD repo-server parse the whole index.yaml of the
+// repository, so applications sharing a repository must not each trigger a request.
+func TestGetHelmChartVersions_AsksArgoCDOncePerRepository(t *testing.T) {
+	lister := &stubHelmChartLister{
+		response: &reposerver.HelmChartsResponse{
+			Items: []*reposerver.HelmChart{
+				{Name: "nginx", Versions: []string{"1.20.0", "1.21.0"}},
+				{Name: "redis", Versions: []string{"7.0.0"}},
+			},
+		},
+	}
+	client := newTestClient(lister)
+
+	for i := 0; i < 10; i++ {
+		versions, err := client.GetHelmChartVersions(context.Background(), "https://charts.example.com", "nginx", "team-a")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"1.20.0", "1.21.0"}, versions)
+	}
+
+	assert.Equal(t, 1, lister.callCount())
+
+	// A second chart of the same repository is already in the cached response.
+	versions, err := client.GetHelmChartVersions(context.Background(), "https://charts.example.com", "redis", "team-a")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"7.0.0"}, versions)
+	assert.Equal(t, 1, lister.callCount())
+
+	// So is the answer for a chart the repository does not hold.
+	versions, err = client.GetHelmChartVersions(context.Background(), "https://charts.example.com", "postgresql", "team-a")
+	require.NoError(t, err)
+	assert.Empty(t, versions)
+	assert.Equal(t, 1, lister.callCount())
+}
+
+// TestGetHelmChartVersions_CachesPerRepositoryAndProject checks that the cache key is
+// specific enough: the same URL resolves with the credentials of the asking project, and
+// a different repository is a different repository.
+func TestGetHelmChartVersions_CachesPerRepositoryAndProject(t *testing.T) {
+	lister := &stubHelmChartLister{
+		response: &reposerver.HelmChartsResponse{
+			Items: []*reposerver.HelmChart{
+				{Name: "nginx", Versions: []string{"1.21.0"}},
+			},
+		},
+	}
+	client := newTestClient(lister)
+
+	for _, query := range []struct {
+		repoURL string
+		project string
+	}{
+		{repoURL: "https://charts.example.com", project: "team-a"},
+		{repoURL: "https://charts.example.com", project: "team-b"},
+		{repoURL: "https://charts.example.com", project: ""},
+		{repoURL: "https://other.example.com", project: "team-a"},
+	} {
+		// Twice each, as only the first one may reach ArgoCD.
+		for i := 0; i < 2; i++ {
+			_, err := client.GetHelmChartVersions(context.Background(), query.repoURL, "nginx", query.project)
+			require.NoError(t, err)
+		}
+	}
+
+	assert.Equal(t, 4, lister.callCount())
+	assert.Equal(t, []string{"team-a", "team-b", "", "team-a"}, lister.projectsAsked())
+}
+
+// TestGetHelmChartVersions_DoesNotCacheFailures checks that a failed request leaves no
+// trace in the cache: it can be a temporary ArgoCD problem, and the next application has
+// to be free to retry.
+func TestGetHelmChartVersions_DoesNotCacheFailures(t *testing.T) {
+	lister := &stubHelmChartLister{
+		err:               errors.New("repo-server unavailable"),
+		failOnlyFirstCall: true,
+		response: &reposerver.HelmChartsResponse{
+			Items: []*reposerver.HelmChart{
+				{Name: "nginx", Versions: []string{"1.21.0"}},
+			},
+		},
+	}
+	client := newTestClient(lister)
+
+	_, err := client.GetHelmChartVersions(context.Background(), "https://charts.example.com", "nginx", "team-a")
+	require.Error(t, err)
+
+	versions, err := client.GetHelmChartVersions(context.Background(), "https://charts.example.com", "nginx", "team-a")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"1.21.0"}, versions)
+	assert.Equal(t, 2, lister.callCount())
+}
+
+// TestGetHelmChartVersions_ConcurrentCallersShareOneRequest covers what the worker pool
+// actually does: callers asking for the same repository at the same time would all miss
+// an empty cache, so they have to wait for the one request already in flight.
+func TestGetHelmChartVersions_ConcurrentCallersShareOneRequest(t *testing.T) {
+	lister := &stubHelmChartLister{
+		response: &reposerver.HelmChartsResponse{
+			Items: []*reposerver.HelmChart{
+				{Name: "nginx", Versions: []string{"1.20.0", "1.21.0"}},
+			},
+		},
+		entered: make(chan struct{}, 10),
+		block:   make(chan struct{}),
+	}
+	client := newTestClient(lister)
+
+	const callers = 10
+	var started, done sync.WaitGroup
+	started.Add(callers)
+	done.Add(callers)
+
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer done.Done()
+			started.Done()
+
+			versions, err := client.GetHelmChartVersions(context.Background(), "https://charts.example.com", "nginx", "team-a")
+			assert.NoError(t, err)
+			assert.Equal(t, []string{"1.20.0", "1.21.0"}, versions)
+		}()
+	}
+
+	// Hold the first request inside ArgoCD until every caller is on its way, so that
+	// any caller starting a request of its own has the time to be counted.
+	started.Wait()
+	<-lister.entered
+	time.Sleep(50 * time.Millisecond)
+	close(lister.block)
+
+	done.Wait()
+	assert.Equal(t, 1, lister.callCount())
+}
+
+// TestGetHelmChartVersions_WaitingCallerRespectsContext checks that a caller waiting for
+// the request of another caller still gives up when its own context is cancelled.
+func TestGetHelmChartVersions_WaitingCallerRespectsContext(t *testing.T) {
+	lister := &stubHelmChartLister{
+		response: &reposerver.HelmChartsResponse{},
+		entered:  make(chan struct{}, 1),
+		block:    make(chan struct{}),
+	}
+	defer close(lister.block)
+	client := newTestClient(lister)
+
+	go func() {
+		_, _ = client.GetHelmChartVersions(context.Background(), "https://charts.example.com", "nginx", "team-a")
+	}()
+	<-lister.entered
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := client.GetHelmChartVersions(ctx, "https://charts.example.com", "nginx", "team-a")
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+// TestGetHelmChartVersions_CallersCannotCorruptTheCache checks that callers get their own
+// copy of the versions: the cached response is shared by all of them.
+func TestGetHelmChartVersions_CallersCannotCorruptTheCache(t *testing.T) {
+	lister := &stubHelmChartLister{
+		response: &reposerver.HelmChartsResponse{
+			Items: []*reposerver.HelmChart{
+				{Name: "nginx", Versions: []string{"1.20.0", "1.21.0"}},
+			},
+		},
+	}
+	client := newTestClient(lister)
+
+	versions, err := client.GetHelmChartVersions(context.Background(), "https://charts.example.com", "nginx", "team-a")
+	require.NoError(t, err)
+	versions[0] = "corrupted"
+
+	versions, err = client.GetHelmChartVersions(context.Background(), "https://charts.example.com", "nginx", "team-a")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"1.20.0", "1.21.0"}, versions)
 }
 
 func TestFilterOptions(t *testing.T) {

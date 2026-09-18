@@ -5,7 +5,9 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
+	"sync"
 
 	"github.com/argoproj/argo-cd/v2/pkg/apiclient"
 	"github.com/argoproj/argo-cd/v2/pkg/apiclient/application"
@@ -22,12 +24,26 @@ type helmChartLister interface {
 	GetHelmCharts(ctx context.Context, in *repository.RepoQuery, opts ...grpc.CallOption) (*reposerver.HelmChartsResponse, error)
 }
 
+// helmChartsCacheKey identifies a cached ArgoCD helmcharts response. The project is part
+// of the key because the same URL can resolve with different credentials, and therefore
+// to a different set of charts, depending on the project of the asking application.
+type helmChartsCacheKey struct {
+	repoURL string
+	project string
+}
+
 // Client wraps ArgoCD API client
 type Client struct {
 	apiClient  apiclient.Client
 	appClient  application.ApplicationServiceClient
 	repoClient helmChartLister
 	logger     *logrus.Entry
+
+	// helmChartsCache maps helmChartsCacheKey to *helmChartsCacheEntry and lives only
+	// for the duration of the run. Every GetHelmCharts call makes the ArgoCD
+	// repo-server download and parse the whole index.yaml of a repository, so hundreds
+	// of applications sharing a repository must not turn into hundreds of requests.
+	helmChartsCache sync.Map
 }
 
 // NewClient creates a new ArgoCD API client.
@@ -218,15 +234,14 @@ func (c *Client) GetHelmChartVersions(ctx context.Context, repoURL, chartName, p
 		"project": project,
 	}).Debug("Fetching Helm chart versions from ArgoCD")
 
-	charts, err := c.repoClient.GetHelmCharts(ctx, &repository.RepoQuery{
-		Repo:       repoURL,
-		AppProject: project,
-	})
+	charts, err := c.helmChartsOfRepository(ctx, repoURL, project)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get Helm charts of repository %s: %w", repoURL, err)
+		return nil, err
 	}
 
-	versions := findChartVersions(charts, chartName)
+	// The response is shared by every caller of the repository, so callers get a copy
+	// they are free to modify.
+	versions := slices.Clone(findChartVersions(charts, chartName))
 
 	c.logger.WithFields(logrus.Fields{
 		"repo":           repoURL,
@@ -236,6 +251,64 @@ func (c *Client) GetHelmChartVersions(ctx context.Context, repoURL, chartName, p
 	}).Debug("Received Helm chart versions from ArgoCD")
 
 	return versions, nil
+}
+
+// helmChartsOfRepository returns every chart ArgoCD reports for a repository, asking
+// ArgoCD once per repository and project and serving later callers from the cache.
+//
+// Callers run in parallel worker goroutines, so a cache lookup alone is not enough: the
+// first callers would all miss it at the same time and all hit ArgoCD. Callers that
+// arrive while a repository is being fetched therefore wait for that single in-flight
+// request instead of starting their own.
+func (c *Client) helmChartsOfRepository(ctx context.Context, repoURL, project string) (*reposerver.HelmChartsResponse, error) {
+	key := helmChartsCacheKey{repoURL: repoURL, project: project}
+
+	entry := &helmChartsCacheEntry{ready: make(chan struct{})}
+	if cached, loaded := c.helmChartsCache.LoadOrStore(key, entry); loaded {
+		c.logger.WithFields(logrus.Fields{
+			"repo":    repoURL,
+			"project": project,
+		}).Debug("Reusing the cached Helm charts of the repository")
+
+		return cached.(*helmChartsCacheEntry).wait(ctx)
+	}
+
+	// This goroutine stored the entry, so it owns the single request to ArgoCD.
+	charts, err := c.repoClient.GetHelmCharts(ctx, &repository.RepoQuery{
+		Repo:       repoURL,
+		AppProject: project,
+	})
+	if err != nil {
+		// A failure is not worth caching: it can be a cancelled context or a
+		// temporary ArgoCD problem, and the next application must be free to retry.
+		c.helmChartsCache.Delete(key)
+		err = fmt.Errorf("failed to get Helm charts of repository %s: %w", repoURL, err)
+	}
+
+	entry.charts, entry.err = charts, err
+	close(entry.ready)
+
+	return charts, err
+}
+
+// helmChartsCacheEntry holds the outcome of one GetHelmCharts call. ready is closed once
+// charts and err are written, which is what makes them safe to read from other
+// goroutines.
+type helmChartsCacheEntry struct {
+	ready  chan struct{}
+	charts *reposerver.HelmChartsResponse
+	err    error
+}
+
+// wait blocks until the request owning the entry has finished, and reports the outcome it
+// got. It gives up when the caller's own context is cancelled.
+func (e *helmChartsCacheEntry) wait(ctx context.Context) (*reposerver.HelmChartsResponse, error) {
+	select {
+	case <-e.ready:
+		return e.charts, e.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // findChartVersions picks the versions of a single chart out of an ArgoCD helmcharts
