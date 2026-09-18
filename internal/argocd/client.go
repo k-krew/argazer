@@ -5,35 +5,16 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/argoproj/argo-cd/v2/pkg/apiclient"
-	"github.com/argoproj/argo-cd/v2/pkg/apiclient/application"
-	"github.com/argoproj/argo-cd/v2/pkg/apiclient/repository"
-	"github.com/argoproj/argo-cd/v2/pkg/apiclient/session"
-	"github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
-	reposerver "github.com/argoproj/argo-cd/v2/reposerver/apiclient"
 	"github.com/sirupsen/logrus"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
-
-// repositoryService holds the calls Argazer needs from the ArgoCD repository service:
-// the charts of a Helm repository and the refs of a Git repository.
-type repositoryService interface {
-	GetHelmCharts(ctx context.Context, in *repository.RepoQuery, opts ...grpc.CallOption) (*reposerver.HelmChartsResponse, error)
-	ListRefs(ctx context.Context, in *repository.RepoQuery, opts ...grpc.CallOption) (*reposerver.Refs, error)
-}
-
-// ociTagLister lists the tags of an OCI artifact through ArgoCD.
-type ociTagLister interface {
-	ListOCITags(ctx context.Context, artifact, project string) ([]string, error)
-}
 
 // Requests for a repository are retried before their error is handed to every caller
 // waiting for them. Without retries a single hiccup of the repo-server skips a repository
@@ -46,13 +27,10 @@ const (
 	defaultRetryBackoff = 500 * time.Millisecond
 )
 
-// Client wraps ArgoCD API client
+// Client reads applications and repository versions from the ArgoCD REST API.
 type Client struct {
-	apiClient  apiclient.Client
-	appClient  application.ApplicationServiceClient
-	repoClient repositoryService
-	ociClient  ociTagLister
-	logger     *logrus.Entry
+	rest   *restClient
+	logger *logrus.Entry
 
 	// retryBackoff overrides defaultRetryBackoff, which is what a zero value means. It
 	// exists so that tests do not have to wait for real backoffs.
@@ -65,7 +43,7 @@ type Client struct {
 	repoCache sync.Map
 }
 
-// NewClient creates a new ArgoCD API client.
+// NewClient creates a client for the ArgoCD API.
 // When authToken is not empty it is used as is, otherwise a session is created from username/password.
 func NewClient(serverURL, username, password, authToken string, insecure bool, logger *logrus.Entry) (*Client, error) {
 	authMethod := "password"
@@ -80,45 +58,12 @@ func NewClient(serverURL, username, password, authToken string, insecure bool, l
 		"auth_method": authMethod,
 	}).Info("Creating ArgoCD API client")
 
-	// Create ArgoCD client options
-	opts := apiclient.ClientOptions{
-		ServerAddr: serverURL,
-		PlainText:  strings.HasPrefix(serverURL, "http://"),
-		Insecure:   insecure,
-		GRPCWeb:    true, // Use gRPC-Web mode to avoid warnings and support HTTP proxies
+	if authToken == "" && (username == "" || password == "") {
+		return nil, fmt.Errorf("an auth token, or a username and password, are required to authenticate with ArgoCD")
 	}
 
-	// Without a token, exchange username/password for a session token
-	if authToken == "" {
-		sessionToken, err := createSessionToken(&opts, username, password, logger)
-		if err != nil {
-			return nil, err
-		}
-		authToken = sessionToken
-	}
-
-	opts.AuthToken = authToken
-
-	// Create authenticated client
-	apiClient, err := apiclient.NewClient(&opts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create authenticated client: %w", err)
-	}
-
-	// Create application service client
-	_, appClient, err := apiClient.NewApplicationClient()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create application client: %w", err)
-	}
-
-	// Create repository service client, used to read chart versions through ArgoCD
-	_, repoClient, err := apiClient.NewRepoClient()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create repository client: %w", err)
-	}
-
-	// OCI tags are read over REST, see ociTagsClient. Every request bounds itself, so the
-	// client has no timeout of its own, see ociTagsRequestTimeout.
+	// Every request bounds itself, so the client has no timeout of its own, see
+	// repoRequestTimeout.
 	httpClient := &http.Client{}
 	if insecure {
 		// The default transport is cloned rather than replaced so that everything else it
@@ -133,47 +78,27 @@ func NewClient(serverURL, username, password, authToken string, insecure bool, l
 		httpClient.Transport = insecureTransport
 	}
 
+	rest := &restClient{
+		baseURL:    restBaseURL(serverURL),
+		httpClient: httpClient,
+	}
+
+	// Without a token, exchange username/password for a session token.
+	if authToken == "" {
+		sessionToken, err := rest.login(context.Background(), username, password)
+		if err != nil {
+			return nil, err
+		}
+		authToken = sessionToken
+	}
+	rest.authToken = authToken
+
 	logger.Info("Successfully created ArgoCD API client")
 
 	return &Client{
-		apiClient:  apiClient,
-		appClient:  appClient,
-		repoClient: repoClient,
-		ociClient: &ociTagsClient{
-			baseURL:    restBaseURL(serverURL),
-			authToken:  authToken,
-			httpClient: httpClient,
-		},
+		rest:   rest,
 		logger: logger,
 	}, nil
-}
-
-// createSessionToken logs in with username/password and returns a session token
-func createSessionToken(opts *apiclient.ClientOptions, username, password string, logger *logrus.Entry) (string, error) {
-	apiClient, err := apiclient.NewClient(opts)
-	if err != nil {
-		return "", fmt.Errorf("failed to create ArgoCD API client: %w", err)
-	}
-
-	closer, sessionClient, err := apiClient.NewSessionClient()
-	if err != nil {
-		return "", fmt.Errorf("failed to create session client: %w", err)
-	}
-	defer func() {
-		if err := closer.Close(); err != nil {
-			logger.WithError(err).Warn("Failed to close session client")
-		}
-	}()
-
-	sessionResp, err := sessionClient.Create(context.Background(), &session.SessionCreateRequest{
-		Username: username,
-		Password: password,
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to authenticate with ArgoCD: %w", err)
-	}
-
-	return sessionResp.Token, nil
 }
 
 // FilterOptions defines filtering criteria for applications
@@ -184,67 +109,65 @@ type FilterOptions struct {
 }
 
 // ListApplications lists ArgoCD applications with optional filtering
-func (c *Client) ListApplications(ctx context.Context, filter FilterOptions) ([]*v1alpha1.Application, error) {
+func (c *Client) ListApplications(ctx context.Context, filter FilterOptions) ([]*Application, error) {
 	c.logger.WithFields(logrus.Fields{
 		"projects":  filter.Projects,
 		"app_names": filter.AppNames,
 		"labels":    filter.Labels,
 	}).Debug("Listing ArgoCD applications")
 
-	// Build query - use Projects field directly instead of selector
-	query := &application.ApplicationQuery{}
-
-	// Add project filter using the Projects field
-	if len(filter.Projects) > 0 && !contains(filter.Projects, "*") {
-		query.Projects = filter.Projects
-		c.logger.WithField("projects", filter.Projects).Debug("Filtering by projects")
-	}
-
-	// Add app name filter using the AppNamePattern field for server-side filtering
-	if len(filter.AppNames) > 0 && !contains(filter.AppNames, "*") {
-		// If single app name, use AppNamePattern
-		if len(filter.AppNames) == 1 {
-			query.Name = &filter.AppNames[0]
-			c.logger.WithField("app_name", filter.AppNames[0]).Debug("Filtering by app name")
-		}
-		// For multiple app names, we'll still need to filter client-side
-		// as ArgoCD API doesn't support multiple app names in one query
-	}
-
-	// Build label selector if needed
-	if len(filter.Labels) > 0 {
-		var labelSelectors []string
-		for key, value := range filter.Labels {
-			labelSelectors = append(labelSelectors, fmt.Sprintf("%s=%s", key, value))
-		}
-		selectorStr := strings.Join(labelSelectors, ",")
-		query.Selector = &selectorStr
-		c.logger.WithField("label_selector", selectorStr).Debug("Filtering by labels")
-	}
-
-	// List applications
-	appList, err := c.appClient.List(ctx, query)
+	apps, err := c.rest.listApplications(ctx, c.applicationQuery(filter))
 	if err != nil {
 		return nil, fmt.Errorf("failed to list applications: %w", err)
 	}
 
-	var filtered []*v1alpha1.Application
+	// Several app names cannot be asked for in one query, so they are filtered here.
+	filterNames := len(filter.AppNames) > 1 && !contains(filter.AppNames, "*")
 
-	// Filter by app names if we have multiple (client-side filter)
-	for _, app := range appList.Items {
-		// Check app name filter (only needed if multiple app names specified)
-		if len(filter.AppNames) > 1 && !contains(filter.AppNames, "*") {
-			if !contains(filter.AppNames, app.Name) {
-				continue
-			}
+	filtered := make([]*Application, 0, len(apps))
+	for i := range apps {
+		app := &apps[i]
+		if filterNames && !contains(filter.AppNames, app.Metadata.Name) {
+			continue
 		}
 
-		filtered = append(filtered, &app)
+		filtered = append(filtered, app)
 	}
 
 	c.logger.WithField("count", len(filtered)).Info("Found applications")
 
 	return filtered, nil
+}
+
+// applicationQuery turns the filters into the query parameters of the applications
+// endpoint, so that ArgoCD leaves out what the run is not interested in.
+func (c *Client) applicationQuery(filter FilterOptions) url.Values {
+	query := url.Values{}
+
+	if len(filter.Projects) > 0 && !contains(filter.Projects, "*") {
+		query["projects"] = filter.Projects
+		c.logger.WithField("projects", filter.Projects).Debug("Filtering by projects")
+	}
+
+	// ArgoCD matches a single name, while several of them are left to ListApplications.
+	if len(filter.AppNames) == 1 && !contains(filter.AppNames, "*") {
+		query.Set("name", filter.AppNames[0])
+		c.logger.WithField("app_name", filter.AppNames[0]).Debug("Filtering by app name")
+	}
+
+	if len(filter.Labels) > 0 {
+		// The labels are sorted so that the same filter always makes the same request.
+		labelSelectors := make([]string, 0, len(filter.Labels))
+		for _, key := range slices.Sorted(maps.Keys(filter.Labels)) {
+			labelSelectors = append(labelSelectors, fmt.Sprintf("%s=%s", key, filter.Labels[key]))
+		}
+
+		selector := strings.Join(labelSelectors, ",")
+		query.Set("selector", selector)
+		c.logger.WithField("label_selector", selector).Debug("Filtering by labels")
+	}
+
+	return query
 }
 
 // GetHelmChartVersions returns the versions ArgoCD knows about for a chart in a Helm
@@ -263,11 +186,8 @@ func (c *Client) GetHelmChartVersions(ctx context.Context, repoURL, chartName, p
 	}).Debug("Fetching Helm chart versions from ArgoCD")
 
 	charts, err := cachedRepoRequest(ctx, c, helmChartsKey{repoURL: repoURL, project: project},
-		func(ctx context.Context) (*reposerver.HelmChartsResponse, error) {
-			return c.repoClient.GetHelmCharts(ctx, &repository.RepoQuery{
-				Repo:       repoURL,
-				AppProject: project,
-			})
+		func(ctx context.Context) ([]helmChart, error) {
+			return c.rest.listHelmCharts(ctx, repoURL, project)
 		})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get Helm charts of repository %s: %w", repoURL, err)
@@ -303,7 +223,7 @@ func (c *Client) GetOCITags(ctx context.Context, repoURL, chartName, project str
 
 	tags, err := cachedRepoRequest(ctx, c, ociTagsKey{artifact: artifact, project: project},
 		func(ctx context.Context) ([]string, error) {
-			return c.ociClient.ListOCITags(ctx, artifact, project)
+			return c.rest.listOCITags(ctx, artifact, project)
 		})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get the OCI tags of %s: %w", artifact, err)
@@ -332,12 +252,9 @@ func (c *Client) GetGitTags(ctx context.Context, repoURL, project string) ([]str
 		"project": project,
 	}).Debug("Fetching Git tags from ArgoCD")
 
-	refs, err := cachedRepoRequest(ctx, c, gitRefsKey{repoURL: repoURL, project: project},
-		func(ctx context.Context) (*reposerver.Refs, error) {
-			return c.repoClient.ListRefs(ctx, &repository.RepoQuery{
-				Repo:       repoURL,
-				AppProject: project,
-			})
+	found, err := cachedRepoRequest(ctx, c, gitRefsKey{repoURL: repoURL, project: project},
+		func(ctx context.Context) (*refs, error) {
+			return c.rest.listRefs(ctx, repoURL, project)
 		})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get the refs of Git repository %s: %w", repoURL, err)
@@ -346,40 +263,12 @@ func (c *Client) GetGitTags(ctx context.Context, repoURL, project string) ([]str
 	c.logger.WithFields(logrus.Fields{
 		"repo":       repoURL,
 		"project":    project,
-		"tags_count": len(refs.GetTags()),
+		"tags_count": len(found.Tags),
 	}).Debug("Received Git tags from ArgoCD")
 
 	// The cached response is shared by every caller of the repository, so callers get a
 	// copy they are free to modify.
-	return slices.Clone(refs.GetTags()), nil
-}
-
-// ociArtifact builds the reference of the OCI artifact holding a chart, which is what
-// ArgoCD lists the tags of.
-//
-// The repository URL is passed on exactly as the Application spells it, because that same
-// string is what ArgoCD looks its credentials up by, and it matches a registered
-// repository only as a whole. Dropping the oci:// scheme, for one, would turn a repository
-// registered as "oci://ghcr.io/myorg/nginx" into an unknown one, and ArgoCD would fall
-// back to an anonymous request the registry rejects.
-//
-// A source with the scheme is an OCI source to ArgoCD: its URL already names the artifact
-// and a chart name, should the Application carry one, is not part of the reference. A
-// source without it is a Helm source, which names the registry path and the chart
-// separately the way Helm does, so chart "nginx" of "ghcr.io/myorg/charts" lives in
-// "ghcr.io/myorg/charts/nginx".
-func ociArtifact(repoURL, chartName string) string {
-	if strings.HasPrefix(repoURL, "oci://") {
-		return strings.TrimSuffix(repoURL, "/")
-	}
-
-	artifact := strings.Trim(repoURL, "/")
-	chartName = strings.Trim(chartName, "/")
-	if chartName == "" {
-		return artifact
-	}
-
-	return artifact + "/" + chartName
+	return slices.Clone(found.Tags), nil
 }
 
 // Cache keys of the repository requests. Every kind of request has its own key type, which
@@ -526,22 +415,9 @@ func worthRetrying(ctx context.Context, err error) bool {
 		return responseErr.worthRetrying()
 	}
 
-	if grpcStatus, ok := status.FromError(err); ok && slices.Contains(permanentCodes, grpcStatus.Code()) {
-		return false
-	}
-
+	// Anything else is a connection that did not come about, which the next attempt may
+	// well have better luck with.
 	return true
-}
-
-// permanentCodes are the answers of ArgoCD that say the request itself is wrong, rather
-// than that ArgoCD is momentarily unable to serve it.
-var permanentCodes = []codes.Code{
-	codes.NotFound,
-	codes.PermissionDenied,
-	codes.Unauthenticated,
-	codes.InvalidArgument,
-	codes.Unimplemented,
-	codes.FailedPrecondition,
 }
 
 // repoCacheEntry holds the outcome of one request to ArgoCD. ready is closed once value
@@ -564,15 +440,11 @@ func (e *repoCacheEntry[T]) wait(ctx context.Context) (T, error) {
 	}
 }
 
-// findChartVersions picks the versions of a single chart out of an ArgoCD helmcharts
-// response, and returns nil when the response does not mention the chart.
-func findChartVersions(charts *reposerver.HelmChartsResponse, chartName string) []string {
-	if charts == nil {
-		return nil
-	}
-
-	for _, chart := range charts.Items {
-		if chart != nil && chart.Name == chartName {
+// findChartVersions picks the versions of a single chart out of the charts of a repository,
+// and returns nil when none of them is the chart in question.
+func findChartVersions(charts []helmChart, chartName string) []string {
+	for _, chart := range charts {
+		if chart.Name == chartName {
 			return chart.Versions
 		}
 	}

@@ -8,15 +8,14 @@ import (
 	"os"
 	"testing"
 
+	"argazer/internal/argocd"
 	"argazer/internal/config"
 	"argazer/internal/helm"
 	"argazer/internal/notification"
 
-	"github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestSetupLogging(t *testing.T) {
@@ -53,15 +52,15 @@ func TestFindHelmSource(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		app        *v1alpha1.Application
+		app        *argocd.Application
 		sourceName string
 		expected   bool
 	}{
 		{
 			name: "single source with helm chart",
-			app: &v1alpha1.Application{
-				Spec: v1alpha1.ApplicationSpec{
-					Source: &v1alpha1.ApplicationSource{
+			app: &argocd.Application{
+				Spec: argocd.ApplicationSpec{
+					Source: &argocd.ApplicationSource{
 						Chart:          "my-chart",
 						RepoURL:        "https://charts.example.com",
 						TargetRevision: "1.0.0",
@@ -73,9 +72,9 @@ func TestFindHelmSource(t *testing.T) {
 		},
 		{
 			name: "single source without helm chart",
-			app: &v1alpha1.Application{
-				Spec: v1alpha1.ApplicationSpec{
-					Source: &v1alpha1.ApplicationSource{
+			app: &argocd.Application{
+				Spec: argocd.ApplicationSpec{
+					Source: &argocd.ApplicationSource{
 						RepoURL:        "https://github.com/example/repo",
 						TargetRevision: "main",
 						Path:           "manifests",
@@ -87,9 +86,9 @@ func TestFindHelmSource(t *testing.T) {
 		},
 		{
 			name: "multi-source with helm chart",
-			app: &v1alpha1.Application{
-				Spec: v1alpha1.ApplicationSpec{
-					Sources: []v1alpha1.ApplicationSource{
+			app: &argocd.Application{
+				Spec: argocd.ApplicationSpec{
+					Sources: []argocd.ApplicationSource{
 						{
 							RepoURL:        "https://github.com/example/repo",
 							TargetRevision: "main",
@@ -109,9 +108,9 @@ func TestFindHelmSource(t *testing.T) {
 		},
 		{
 			name: "multi-source fallback to any helm source",
-			app: &v1alpha1.Application{
-				Spec: v1alpha1.ApplicationSpec{
-					Sources: []v1alpha1.ApplicationSource{
+			app: &argocd.Application{
+				Spec: argocd.ApplicationSpec{
+					Sources: []argocd.ApplicationSource{
 						{
 							RepoURL:        "https://github.com/example/repo",
 							TargetRevision: "main",
@@ -130,9 +129,9 @@ func TestFindHelmSource(t *testing.T) {
 		},
 		{
 			name: "multi-source no helm charts",
-			app: &v1alpha1.Application{
-				Spec: v1alpha1.ApplicationSpec{
-					Sources: []v1alpha1.ApplicationSource{
+			app: &argocd.Application{
+				Spec: argocd.ApplicationSpec{
+					Sources: []argocd.ApplicationSource{
 						{
 							RepoURL:        "https://github.com/example/repo1",
 							TargetRevision: "main",
@@ -151,9 +150,9 @@ func TestFindHelmSource(t *testing.T) {
 		},
 		{
 			name: "multi-source named source not found",
-			app: &v1alpha1.Application{
-				Spec: v1alpha1.ApplicationSpec{
-					Sources: []v1alpha1.ApplicationSource{
+			app: &argocd.Application{
+				Spec: argocd.ApplicationSpec{
+					Sources: []argocd.ApplicationSource{
 						{
 							Name:           "other-source",
 							Chart:          "my-chart",
@@ -528,7 +527,7 @@ func TestCheckApplicationsConcurrently(t *testing.T) {
 	}
 
 	// Test with empty app list
-	apps := []*v1alpha1.Application{}
+	apps := []*argocd.Application{}
 	results := checkApplicationsConcurrently(context.Background(), apps, nil, cfg, logger)
 	assert.Equal(t, 0, len(results))
 }
@@ -539,7 +538,7 @@ func TestCheckApplicationsConcurrently_ZeroConcurrency(t *testing.T) {
 		Concurrency: 0, // Should fallback to 10
 	}
 
-	apps := []*v1alpha1.Application{}
+	apps := []*argocd.Application{}
 	results := checkApplicationsConcurrently(context.Background(), apps, nil, cfg, logger)
 	assert.Equal(t, 0, len(results))
 }
@@ -550,7 +549,7 @@ func TestCheckApplicationsConcurrently_NegativeConcurrency(t *testing.T) {
 		Concurrency: -5, // Should fallback to 10
 	}
 
-	apps := []*v1alpha1.Application{}
+	apps := []*argocd.Application{}
 	results := checkApplicationsConcurrently(context.Background(), apps, nil, cfg, logger)
 	assert.Equal(t, 0, len(results))
 }
@@ -701,13 +700,13 @@ func TestCheckApplication_NonHelmApp(t *testing.T) {
 	logger := logrus.NewEntry(logrus.New())
 	cfg := &config.Config{}
 
-	app := &v1alpha1.Application{
-		ObjectMeta: metav1.ObjectMeta{
+	app := &argocd.Application{
+		Metadata: argocd.ApplicationMetadata{
 			Name: "git-app",
 		},
-		Spec: v1alpha1.ApplicationSpec{
+		Spec: argocd.ApplicationSpec{
 			Project: "default",
-			Source: &v1alpha1.ApplicationSource{
+			Source: &argocd.ApplicationSource{
 				RepoURL:        "https://github.com/example/repo",
 				TargetRevision: "main",
 				Path:           "manifests",
@@ -747,13 +746,13 @@ func TestCheckApplication_MultiSourceWithHelm(t *testing.T) {
 		SourceName: "chart-source",
 	}
 
-	app := &v1alpha1.Application{
-		ObjectMeta: metav1.ObjectMeta{
+	app := &argocd.Application{
+		Metadata: argocd.ApplicationMetadata{
 			Name: "multi-source-app",
 		},
-		Spec: v1alpha1.ApplicationSpec{
+		Spec: argocd.ApplicationSpec{
 			Project: "default",
-			Sources: []v1alpha1.ApplicationSource{
+			Sources: []argocd.ApplicationSource{
 				{
 					RepoURL:        "https://github.com/example/values",
 					TargetRevision: "main",

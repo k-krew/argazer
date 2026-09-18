@@ -12,7 +12,6 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -307,7 +306,7 @@ func initializeClients(_ context.Context, cfg *config.Config, logger *logrus.Ent
 }
 
 // fetchApplications retrieves applications from ArgoCD based on filters
-func fetchApplications(ctx context.Context, client *argocd.Client, cfg *config.Config, logger *logrus.Entry) ([]*v1alpha1.Application, error) {
+func fetchApplications(ctx context.Context, client *argocd.Client, cfg *config.Config, logger *logrus.Entry) ([]*argocd.Application, error) {
 	apps, err := client.ListApplications(ctx, argocd.FilterOptions{
 		Projects: cfg.Projects,
 		AppNames: cfg.AppNames,
@@ -338,7 +337,7 @@ type ApplicationCheckResult struct {
 }
 
 // checkApplicationsConcurrently checks multiple applications in parallel using a worker pool
-func checkApplicationsConcurrently(ctx context.Context, apps []*v1alpha1.Application, helmChecker *helm.Checker, cfg *config.Config, logger *logrus.Entry) []ApplicationCheckResult {
+func checkApplicationsConcurrently(ctx context.Context, apps []*argocd.Application, helmChecker *helm.Checker, cfg *config.Config, logger *logrus.Entry) []ApplicationCheckResult {
 	numWorkers := cfg.Concurrency
 	if numWorkers <= 0 {
 		numWorkers = 10 // Fallback to default
@@ -347,7 +346,7 @@ func checkApplicationsConcurrently(ctx context.Context, apps []*v1alpha1.Applica
 	logger.WithField("concurrency", numWorkers).Debug("Starting concurrent application checks")
 
 	// Create channels for work distribution
-	appChan := make(chan *v1alpha1.Application, len(apps))
+	appChan := make(chan *argocd.Application, len(apps))
 	resultChan := make(chan ApplicationCheckResult, len(apps))
 
 	// Start workers
@@ -385,9 +384,9 @@ func checkApplicationsConcurrently(ctx context.Context, apps []*v1alpha1.Applica
 
 // checkApplication checks a single application for Helm chart updates
 // Returns an ApplicationCheckResult with an empty AppName if the application should be skipped (non-Helm app)
-func checkApplication(ctx context.Context, app *v1alpha1.Application, helmChecker *helm.Checker, cfg *config.Config, logger *logrus.Entry) ApplicationCheckResult {
+func checkApplication(ctx context.Context, app *argocd.Application, helmChecker *helm.Checker, cfg *config.Config, logger *logrus.Entry) ApplicationCheckResult {
 	appLogger := logger.WithFields(logrus.Fields{
-		"app_name": app.Name,
+		"app_name": app.Metadata.Name,
 		"project":  app.Spec.Project,
 	})
 
@@ -410,7 +409,7 @@ func checkApplication(ctx context.Context, app *v1alpha1.Application, helmChecke
 	}
 
 	result := ApplicationCheckResult{
-		AppName:           app.Name,
+		AppName:           app.Metadata.Name,
 		Project:           app.Spec.Project,
 		ChartName:         chartName,
 		CurrentVersion:    helmSource.TargetRevision,
@@ -484,9 +483,9 @@ func requiresManualUpdate(updateType string) bool {
 }
 
 // findHelmSource finds the Helm source in an ArgoCD application
-func findHelmSource(app *v1alpha1.Application, sourceName string, logger *logrus.Entry) *v1alpha1.ApplicationSource {
+func findHelmSource(app *argocd.Application, sourceName string, logger *logrus.Entry) *argocd.ApplicationSource {
 	// Helper function to check if a source is Helm-based
-	isHelmSource := func(source *v1alpha1.ApplicationSource) bool {
+	isHelmSource := func(source *argocd.ApplicationSource) bool {
 		// Check if it's a Helm repository source (has Chart field)
 		if source.Chart != "" {
 			return true
@@ -512,7 +511,7 @@ func findHelmSource(app *v1alpha1.Application, sourceName string, logger *logrus
 				// Match by name AND ensure it's a Helm chart
 				if source.Name == sourceName && isHelmSource(source) {
 					logger.WithFields(logrus.Fields{
-						"app":         app.Name,
+						"app":         app.Metadata.Name,
 						"source_name": source.Name,
 						"chart":       source.Chart,
 						"repo":        source.RepoURL,
@@ -527,7 +526,7 @@ func findHelmSource(app *v1alpha1.Application, sourceName string, logger *logrus
 			source := &app.Spec.Sources[i]
 			if isHelmSource(source) {
 				logger.WithFields(logrus.Fields{
-					"app":         app.Name,
+					"app":         app.Metadata.Name,
 					"source_name": source.Name,
 					"chart":       source.Chart,
 					"repo":        source.RepoURL,
