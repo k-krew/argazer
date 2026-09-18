@@ -9,16 +9,25 @@ import (
 
 	"github.com/argoproj/argo-cd/v2/pkg/apiclient"
 	"github.com/argoproj/argo-cd/v2/pkg/apiclient/application"
+	"github.com/argoproj/argo-cd/v2/pkg/apiclient/repository"
 	"github.com/argoproj/argo-cd/v2/pkg/apiclient/session"
 	"github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
+	reposerver "github.com/argoproj/argo-cd/v2/reposerver/apiclient"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
 )
+
+// helmChartLister is the single call Argazer needs from the ArgoCD repository service.
+type helmChartLister interface {
+	GetHelmCharts(ctx context.Context, in *repository.RepoQuery, opts ...grpc.CallOption) (*reposerver.HelmChartsResponse, error)
+}
 
 // Client wraps ArgoCD API client
 type Client struct {
-	apiClient apiclient.Client
-	appClient application.ApplicationServiceClient
-	logger    *logrus.Entry
+	apiClient  apiclient.Client
+	appClient  application.ApplicationServiceClient
+	repoClient helmChartLister
+	logger     *logrus.Entry
 }
 
 // NewClient creates a new ArgoCD API client.
@@ -79,12 +88,19 @@ func NewClient(serverURL, username, password, authToken string, insecure bool, l
 		return nil, fmt.Errorf("failed to create application client: %w", err)
 	}
 
+	// Create repository service client, used to read chart versions through ArgoCD
+	_, repoClient, err := apiClient.NewRepoClient()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create repository client: %w", err)
+	}
+
 	logger.Info("Successfully created ArgoCD API client")
 
 	return &Client{
-		apiClient: apiClient,
-		appClient: appClient,
-		logger:    logger,
+		apiClient:  apiClient,
+		appClient:  appClient,
+		repoClient: repoClient,
+		logger:     logger,
 	}, nil
 }
 
@@ -185,6 +201,57 @@ func (c *Client) ListApplications(ctx context.Context, filter FilterOptions) ([]
 	c.logger.WithField("count", len(filtered)).Info("Found applications")
 
 	return filtered, nil
+}
+
+// GetHelmChartVersions returns the versions ArgoCD knows about for a chart in a Helm
+// repository. ArgoCD reaches the repository with the credentials it already stores, so
+// Argazer never needs the repository password itself.
+// An empty result means the repository is reachable but holds no such chart.
+//
+// project must be the ArgoCD project of the application that uses the chart. Credentials
+// of a project-scoped repository are only resolved when the project is part of the query,
+// otherwise ArgoCD falls back to an anonymous request and the repository rejects it.
+func (c *Client) GetHelmChartVersions(ctx context.Context, repoURL, chartName, project string) ([]string, error) {
+	c.logger.WithFields(logrus.Fields{
+		"repo":    repoURL,
+		"chart":   chartName,
+		"project": project,
+	}).Debug("Fetching Helm chart versions from ArgoCD")
+
+	charts, err := c.repoClient.GetHelmCharts(ctx, &repository.RepoQuery{
+		Repo:       repoURL,
+		AppProject: project,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get Helm charts of repository %s: %w", repoURL, err)
+	}
+
+	versions := findChartVersions(charts, chartName)
+
+	c.logger.WithFields(logrus.Fields{
+		"repo":           repoURL,
+		"chart":          chartName,
+		"project":        project,
+		"versions_count": len(versions),
+	}).Debug("Received Helm chart versions from ArgoCD")
+
+	return versions, nil
+}
+
+// findChartVersions picks the versions of a single chart out of an ArgoCD helmcharts
+// response, and returns nil when the response does not mention the chart.
+func findChartVersions(charts *reposerver.HelmChartsResponse, chartName string) []string {
+	if charts == nil {
+		return nil
+	}
+
+	for _, chart := range charts.Items {
+		if chart != nil && chart.Name == chartName {
+			return chart.Versions
+		}
+	}
+
+	return nil
 }
 
 // contains checks if a slice contains a string

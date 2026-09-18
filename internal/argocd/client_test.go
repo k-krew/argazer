@@ -1,12 +1,42 @@
 package argocd
 
 import (
+	"context"
+	"errors"
 	"testing"
 
+	"github.com/argoproj/argo-cd/v2/pkg/apiclient/repository"
+	reposerver "github.com/argoproj/argo-cd/v2/reposerver/apiclient"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 )
+
+// stubHelmChartLister records the query ArgoCD receives and answers with a canned response.
+type stubHelmChartLister struct {
+	response *reposerver.HelmChartsResponse
+	err      error
+
+	lastQuery *repository.RepoQuery
+}
+
+func (s *stubHelmChartLister) GetHelmCharts(_ context.Context, in *repository.RepoQuery, _ ...grpc.CallOption) (*reposerver.HelmChartsResponse, error) {
+	s.lastQuery = in
+
+	if s.err != nil {
+		return nil, s.err
+	}
+
+	return s.response, nil
+}
+
+func newTestClient(lister helmChartLister) *Client {
+	return &Client{
+		repoClient: lister,
+		logger:     logrus.NewEntry(logrus.New()),
+	}
+}
 
 func TestContains(t *testing.T) {
 	tests := []struct {
@@ -81,6 +111,102 @@ func TestNewClient_AuthToken(t *testing.T) {
 	client, err := NewClient("http://invalid-argocd-server-that-does-not-exist.example.com", "", "", "some-token", false, logger)
 	require.NoError(t, err)
 	assert.NotNil(t, client)
+}
+
+func TestFindChartVersions(t *testing.T) {
+	charts := &reposerver.HelmChartsResponse{
+		Items: []*reposerver.HelmChart{
+			{Name: "redis", Versions: []string{"7.0.0", "7.1.0"}},
+			nil,
+			{Name: "nginx", Versions: []string{"1.20.0", "1.21.0"}},
+		},
+	}
+
+	tests := []struct {
+		name      string
+		charts    *reposerver.HelmChartsResponse
+		chartName string
+		expected  []string
+	}{
+		{
+			name:      "chart is in the repository",
+			charts:    charts,
+			chartName: "nginx",
+			expected:  []string{"1.20.0", "1.21.0"},
+		},
+		{
+			name:      "chart is not in the repository",
+			charts:    charts,
+			chartName: "postgresql",
+			expected:  nil,
+		},
+		{
+			name:      "empty repository",
+			charts:    &reposerver.HelmChartsResponse{},
+			chartName: "nginx",
+			expected:  nil,
+		},
+		{
+			name:      "no response",
+			charts:    nil,
+			chartName: "nginx",
+			expected:  nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, findChartVersions(tt.charts, tt.chartName))
+		})
+	}
+}
+
+// TestGetHelmChartVersions_PassesProject checks that the application project reaches
+// ArgoCD. Without it ArgoCD cannot resolve the credentials of a project-scoped repository
+// and falls back to an anonymous request.
+func TestGetHelmChartVersions_PassesProject(t *testing.T) {
+	lister := &stubHelmChartLister{
+		response: &reposerver.HelmChartsResponse{
+			Items: []*reposerver.HelmChart{
+				{Name: "nginx", Versions: []string{"1.20.0", "1.21.0"}},
+			},
+		},
+	}
+	client := newTestClient(lister)
+
+	versions, err := client.GetHelmChartVersions(context.Background(), "https://charts.example.com", "nginx", "team-a")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"1.20.0", "1.21.0"}, versions)
+
+	require.NotNil(t, lister.lastQuery)
+	assert.Equal(t, "https://charts.example.com", lister.lastQuery.Repo)
+	assert.Equal(t, "team-a", lister.lastQuery.AppProject)
+}
+
+// TestGetHelmChartVersions_EmptyProject checks that a globally registered repository can
+// still be queried without a project.
+func TestGetHelmChartVersions_EmptyProject(t *testing.T) {
+	lister := &stubHelmChartLister{response: &reposerver.HelmChartsResponse{}}
+	client := newTestClient(lister)
+
+	versions, err := client.GetHelmChartVersions(context.Background(), "https://charts.example.com", "nginx", "")
+	require.NoError(t, err)
+	assert.Nil(t, versions)
+
+	require.NotNil(t, lister.lastQuery)
+	assert.Empty(t, lister.lastQuery.AppProject)
+}
+
+// TestGetHelmChartVersions_Error checks that an ArgoCD failure is wrapped instead of being
+// reported as an empty repository.
+func TestGetHelmChartVersions_Error(t *testing.T) {
+	listerErr := errors.New("permission denied")
+	client := newTestClient(&stubHelmChartLister{err: listerErr})
+
+	_, err := client.GetHelmChartVersions(context.Background(), "https://charts.example.com", "nginx", "team-a")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, listerErr)
+	assert.Contains(t, err.Error(), "https://charts.example.com")
 }
 
 func TestFilterOptions(t *testing.T) {
