@@ -244,6 +244,7 @@ type ApplicationCheckResult struct {
 	ConstraintApplied          string `json:"constraint_applied"`            // Version constraint used: "major", "minor", or "patch"
 	HasUpdateOutsideConstraint bool   `json:"has_update_outside_constraint"` // True if updates exist outside the constraint
 	LatestVersionAll           string `json:"latest_version_all,omitempty"`  // Latest version without constraint (if different)
+	UpdateType                 string `json:"update_type,omitempty"`         // "none", "in-range", "out-of-range" or "pinned"
 }
 
 // checkApplicationsConcurrently checks multiple applications in parallel using a worker pool
@@ -353,28 +354,42 @@ func checkApplication(ctx context.Context, app *v1alpha1.Application, helmChecke
 	result.LatestVersion = constraintResult.LatestVersion
 	result.LatestVersionAll = constraintResult.LatestVersionAll
 	result.HasUpdateOutsideConstraint = constraintResult.HasUpdateOutsideConstraint
+	result.UpdateType = constraintResult.UpdateType
 
-	if constraintResult.LatestVersion != helmSource.TargetRevision {
+	result.HasUpdate = requiresManualUpdate(constraintResult.UpdateType)
+
+	switch {
+	case result.HasUpdate:
 		appLogger.WithFields(logrus.Fields{
 			"current_version":               helmSource.TargetRevision,
 			"latest_version":                constraintResult.LatestVersion,
 			"latest_version_all":            constraintResult.LatestVersionAll,
 			"has_update_outside_constraint": constraintResult.HasUpdateOutsideConstraint,
+			"update_type":                   constraintResult.UpdateType,
 		}).Warn("Update available!")
-		result.HasUpdate = true
-	} else {
-		if constraintResult.HasUpdateOutsideConstraint {
-			appLogger.WithFields(logrus.Fields{
-				"current_version":    helmSource.TargetRevision,
-				"latest_version_all": constraintResult.LatestVersionAll,
-				"constraint":         cfg.VersionConstraint,
-			}).Info("Application is up to date within constraint, but updates exist outside constraint")
-		} else {
-			appLogger.Info("Application is up to date")
-		}
+	case constraintResult.UpdateType == helm.UpdateTypeInRange:
+		appLogger.WithFields(logrus.Fields{
+			"current_version": helmSource.TargetRevision,
+			"latest_version":  constraintResult.LatestVersion,
+		}).Info("Latest version satisfies the target range, ArgoCD applies it automatically")
+	case constraintResult.HasUpdateOutsideConstraint:
+		appLogger.WithFields(logrus.Fields{
+			"current_version":    helmSource.TargetRevision,
+			"latest_version_all": constraintResult.LatestVersionAll,
+			"constraint":         cfg.VersionConstraint,
+		}).Info("Application is up to date within constraint, but updates exist outside constraint")
+	default:
+		appLogger.Info("Application is up to date")
 	}
 
 	return result
+}
+
+// requiresManualUpdate reports whether an update needs someone to edit the Application
+// manifest. An update inside the targetRevision range is deployed by ArgoCD on its own, so
+// only pinned revisions and versions beyond the range require attention.
+func requiresManualUpdate(updateType string) bool {
+	return updateType == helm.UpdateTypeOutOfRange || updateType == helm.UpdateTypePinned
 }
 
 // findHelmSource finds the Helm source in an ArgoCD application

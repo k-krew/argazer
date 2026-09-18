@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"argazer/internal/config"
+	"argazer/internal/helm"
 	"argazer/internal/notification"
 
 	"github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
@@ -714,6 +715,28 @@ func TestCheckApplication_NonHelmApp(t *testing.T) {
 
 	result := checkApplication(context.Background(), app, nil, cfg, logger)
 	assert.Equal(t, "", result.AppName, "Should return empty result for non-Helm app")
+}
+
+// TestRequiresManualUpdate makes sure an update ArgoCD applies on its own (a newer version
+// inside the targetRevision range) is not reported as an update requiring attention, while
+// versions beyond the range and newer versions for a pinned revision are.
+func TestRequiresManualUpdate(t *testing.T) {
+	tests := []struct {
+		updateType string
+		expected   bool
+	}{
+		{updateType: helm.UpdateTypeNone, expected: false},
+		{updateType: helm.UpdateTypeInRange, expected: false},
+		{updateType: helm.UpdateTypeOutOfRange, expected: true},
+		{updateType: helm.UpdateTypePinned, expected: true},
+		{updateType: "", expected: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.updateType, func(t *testing.T) {
+			assert.Equal(t, test.expected, requiresManualUpdate(test.updateType))
+		})
+	}
 }
 
 func TestCheckApplication_MultiSourceWithHelm(t *testing.T) {
