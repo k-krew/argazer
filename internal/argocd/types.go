@@ -45,6 +45,11 @@ type ApplicationSource struct {
 	// Path is the directory of a Git repository the manifests, or the chart, live in.
 	Path string `json:"path,omitempty"`
 
+	// Ref is the name the other sources of a multi-source Application point at this one
+	// by, as in `$values/env/prod.yaml`. A source that carries a Ref and no Chart holds
+	// nothing but values files.
+	Ref string `json:"ref,omitempty"`
+
 	// TargetRevision is the version, range, tag or branch the Application asks for.
 	TargetRevision string `json:"targetRevision,omitempty"`
 

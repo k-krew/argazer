@@ -179,6 +179,104 @@ func TestFindHelmSource(t *testing.T) {
 	}
 }
 
+// TestFindHelmSource_MultiSource checks which source of a multi-source application is
+// taken for the Helm chart. The pattern to get right is a chart alongside a Git repository
+// holding the values files: the chart has to win no matter which of the two is listed
+// first, and a source that is nothing but a `ref` must never be picked.
+func TestFindHelmSource_MultiSource(t *testing.T) {
+	logger := logrus.NewEntry(logrus.New())
+
+	chart := argocd.ApplicationSource{
+		Name:           "chart",
+		Chart:          "my-chart",
+		RepoURL:        "https://charts.example.com",
+		TargetRevision: "1.2.3",
+		Helm:           &argocd.ApplicationSourceHelm{},
+	}
+	valuesRef := argocd.ApplicationSource{
+		Name:           "values",
+		RepoURL:        "https://github.com/example/values.git",
+		TargetRevision: "main",
+		Ref:            "values",
+		Helm:           &argocd.ApplicationSourceHelm{},
+	}
+
+	tests := []struct {
+		name            string
+		sources         []argocd.ApplicationSource
+		sourceName      string
+		expectedRepoURL string // empty means no Helm source is expected
+		expectedChart   string
+	}{
+		{
+			name:            "values ref listed before the chart is ignored",
+			sources:         []argocd.ApplicationSource{valuesRef, chart},
+			expectedRepoURL: chart.RepoURL,
+			expectedChart:   "my-chart",
+		},
+		{
+			name:            "values ref listed after the chart is ignored",
+			sources:         []argocd.ApplicationSource{chart, valuesRef},
+			expectedRepoURL: chart.RepoURL,
+			expectedChart:   "my-chart",
+		},
+		{
+			name:            "a values ref cannot be picked by name",
+			sources:         []argocd.ApplicationSource{valuesRef, chart},
+			sourceName:      "values",
+			expectedRepoURL: chart.RepoURL,
+			expectedChart:   "my-chart",
+		},
+		{
+			name:            "the named chart wins over the other charts",
+			sources:         []argocd.ApplicationSource{chart, {Name: "other-chart", Chart: "other", RepoURL: "https://other.example.com"}},
+			sourceName:      "other-chart",
+			expectedRepoURL: "https://other.example.com",
+			expectedChart:   "other",
+		},
+		{
+			name: "a chart in a Git repository is found when there is no chart source",
+			sources: []argocd.ApplicationSource{
+				valuesRef,
+				{Name: "git-chart", RepoURL: "https://github.com/example/charts.git", Path: "charts/my-chart", Helm: &argocd.ApplicationSourceHelm{}},
+			},
+			expectedRepoURL: "https://github.com/example/charts.git",
+		},
+		{
+			name:    "nothing but a values ref is no Helm source",
+			sources: []argocd.ApplicationSource{valuesRef},
+		},
+		{
+			name: "plain manifests are no Helm source",
+			sources: []argocd.ApplicationSource{
+				{RepoURL: "https://github.com/example/repo", Path: "manifests"},
+				valuesRef,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := &argocd.Application{
+				Metadata: argocd.ApplicationMetadata{Name: "multi-source-app"},
+				Spec:     argocd.ApplicationSpec{Sources: tt.sources},
+			}
+
+			source := findHelmSource(app, tt.sourceName, logger)
+
+			if tt.expectedRepoURL == "" {
+				assert.Nil(t, source)
+				return
+			}
+
+			require.NotNil(t, source)
+			assert.Equal(t, tt.expectedRepoURL, source.RepoURL)
+			assert.Equal(t, tt.expectedChart, source.Chart)
+			assert.Empty(t, source.Ref, "a source carrying only a ref holds no chart")
+		})
+	}
+}
+
 func TestOutputResults(t *testing.T) {
 	// Test with various result scenarios
 	tests := []struct {
@@ -773,6 +871,71 @@ func TestCheckApplication_MultiSourceWithHelm(t *testing.T) {
 	require.NotNil(t, helmSource)
 	assert.Equal(t, "my-chart", helmSource.Chart)
 	assert.Equal(t, "1.0.0", helmSource.TargetRevision)
+}
+
+// stubChartVersions stands in for the ArgoCD client and records what it was asked about, so
+// a test can tell which source of an application the versions were looked up for.
+type stubChartVersions struct {
+	versions []string
+	requests []string
+}
+
+func (s *stubChartVersions) GetHelmChartVersions(_ context.Context, repoURL, chartName, _ string) ([]string, error) {
+	s.requests = append(s.requests, fmt.Sprintf("helm %s %s", repoURL, chartName))
+	return s.versions, nil
+}
+
+func (s *stubChartVersions) GetOCITags(_ context.Context, repoURL, chartName, _ string) ([]string, error) {
+	s.requests = append(s.requests, fmt.Sprintf("oci %s %s", repoURL, chartName))
+	return s.versions, nil
+}
+
+func (s *stubChartVersions) GetGitTags(_ context.Context, repoURL, _ string) ([]string, error) {
+	s.requests = append(s.requests, fmt.Sprintf("git %s", repoURL))
+	return s.versions, nil
+}
+
+// TestCheckApplication_MultiSourceValuesRef checks that an application whose values live in
+// a Git repository alongside the chart is checked for versions of the chart, and that the
+// repository and chart reported are the ones of the chart source rather than of the values.
+func TestCheckApplication_MultiSourceValuesRef(t *testing.T) {
+	logger := logrus.NewEntry(logrus.New())
+	versionSource := &stubChartVersions{versions: []string{"1.0.0", "1.1.0", "2.0.0"}}
+	helmChecker, err := helm.NewChecker(versionSource, logger)
+	require.NoError(t, err)
+
+	app := &argocd.Application{
+		Metadata: argocd.ApplicationMetadata{Name: "multi-source-app"},
+		Spec: argocd.ApplicationSpec{
+			Project: "default",
+			Sources: []argocd.ApplicationSource{
+				{
+					RepoURL:        "https://github.com/example/values.git",
+					TargetRevision: "main",
+					Ref:            "values",
+					Helm:           &argocd.ApplicationSourceHelm{},
+				},
+				{
+					Chart:          "my-chart",
+					RepoURL:        "https://charts.example.com",
+					TargetRevision: "1.0.0",
+					Helm:           &argocd.ApplicationSourceHelm{},
+				},
+			},
+		},
+	}
+
+	cfg := &config.Config{VersionConstraint: config.VersionConstraintMajor}
+	result := checkApplication(context.Background(), app, helmChecker, cfg, logger)
+
+	assert.Equal(t, "multi-source-app", result.AppName)
+	assert.Equal(t, "my-chart", result.ChartName)
+	assert.Equal(t, "https://charts.example.com", result.RepoURL)
+	assert.Equal(t, "1.0.0", result.CurrentVersion)
+	assert.Equal(t, "2.0.0", result.LatestVersion)
+	assert.Empty(t, result.Error)
+	assert.Equal(t, []string{"helm https://charts.example.com my-chart"}, versionSource.requests,
+		"only the chart source should be looked up")
 }
 
 func TestSendNotifications_MultipleMessages(t *testing.T) {

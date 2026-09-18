@@ -497,42 +497,51 @@ func findHelmSource(app *argocd.Application, sourceName string, logger *logrus.E
 		return false
 	}
 
+	// A source that carries a ref and no chart of its own holds the values files the other
+	// sources point at (the `ref: values` pattern). ArgoCD renders nothing from it, and it
+	// has no chart version to look up, so it is never the Helm source.
+	isValuesRef := func(source *argocd.ApplicationSource) bool {
+		return source.Ref != "" && source.Chart == ""
+	}
+
+	found := func(source *argocd.ApplicationSource, message string) *argocd.ApplicationSource {
+		logger.WithFields(logrus.Fields{
+			"app":         app.Metadata.Name,
+			"source_name": source.Name,
+			"chart":       source.Chart,
+			"repo":        source.RepoURL,
+		}).Debug(message)
+		return source
+	}
+
 	// Check if it's a single source application with Helm
 	if app.Spec.Source != nil && isHelmSource(app.Spec.Source) {
 		return app.Spec.Source
 	}
 
-	// Check multi-source applications
-	if app.Spec.Sources != nil {
-		// If sourceName is specified, look for that specific source first
-		if sourceName != "" {
-			for i := range app.Spec.Sources {
-				source := &app.Spec.Sources[i]
-				// Match by name AND ensure it's a Helm chart
-				if source.Name == sourceName && isHelmSource(source) {
-					logger.WithFields(logrus.Fields{
-						"app":         app.Metadata.Name,
-						"source_name": source.Name,
-						"chart":       source.Chart,
-						"repo":        source.RepoURL,
-					}).Debug("Found matching Helm source by name")
-					return source
-				}
-			}
-		}
-
-		// Fallback: find any Helm source
+	// Multi-source applications: a source picked by --source-name wins, then the source
+	// that is a Helm chart, and only then a Helm chart kept in a Git repository. Reaching
+	// for the chart before anything else is what keeps a Git source carrying Helm options,
+	// listed ahead of the chart, from being taken for the chart itself.
+	if sourceName != "" {
 		for i := range app.Spec.Sources {
 			source := &app.Spec.Sources[i]
-			if isHelmSource(source) {
-				logger.WithFields(logrus.Fields{
-					"app":         app.Metadata.Name,
-					"source_name": source.Name,
-					"chart":       source.Chart,
-					"repo":        source.RepoURL,
-				}).Debug("Found Helm source (fallback)")
-				return source
+			if source.Name == sourceName && isHelmSource(source) && !isValuesRef(source) {
+				return found(source, "Found matching Helm source by name")
 			}
+		}
+	}
+
+	for i := range app.Spec.Sources {
+		if source := &app.Spec.Sources[i]; source.Chart != "" {
+			return found(source, "Found the Helm chart source")
+		}
+	}
+
+	for i := range app.Spec.Sources {
+		source := &app.Spec.Sources[i]
+		if isHelmSource(source) && !isValuesRef(source) {
+			return found(source, "Found a Helm chart in a Git repository")
 		}
 	}
 
