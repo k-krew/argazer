@@ -21,12 +21,19 @@ type Client struct {
 	logger    *logrus.Entry
 }
 
-// NewClient creates a new ArgoCD API client
-func NewClient(serverURL, username, password string, insecure bool, logger *logrus.Entry) (*Client, error) {
+// NewClient creates a new ArgoCD API client.
+// When authToken is not empty it is used as is, otherwise a session is created from username/password.
+func NewClient(serverURL, username, password, authToken string, insecure bool, logger *logrus.Entry) (*Client, error) {
+	authMethod := "password"
+	if authToken != "" {
+		authMethod = "token"
+	}
+
 	logger.WithFields(logrus.Fields{
-		"server":   serverURL,
-		"username": username,
-		"insecure": insecure,
+		"server":      serverURL,
+		"username":    username,
+		"insecure":    insecure,
+		"auth_method": authMethod,
 	}).Info("Creating ArgoCD API client")
 
 	// Create HTTP client with optional TLS skip verification
@@ -49,37 +56,19 @@ func NewClient(serverURL, username, password string, insecure bool, logger *logr
 
 	_ = httpClient // Will be used for direct HTTP calls if needed
 
-	// Create API client
-	apiClient, err := apiclient.NewClient(&opts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create ArgoCD API client: %w", err)
-	}
-
-	// Get session token
-	closer, sessionClient, err := apiClient.NewSessionClient()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create session client: %w", err)
-	}
-	defer func() {
-		if err := closer.Close(); err != nil {
-			logger.WithError(err).Warn("Failed to close session client")
+	// Without a token, exchange username/password for a session token
+	if authToken == "" {
+		sessionToken, err := createSessionToken(&opts, username, password, logger)
+		if err != nil {
+			return nil, err
 		}
-	}()
-
-	sessionResp, err := sessionClient.Create(context.Background(), &session.SessionCreateRequest{
-		Username: username,
-		Password: password,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to authenticate with ArgoCD: %w", err)
+		authToken = sessionToken
 	}
 
-	// Update client options with auth token
-	opts.AuthToken = sessionResp.Token
-	opts.GRPCWeb = true // Ensure gRPC-Web is enabled for authenticated client too
+	opts.AuthToken = authToken
 
-	// Recreate client with auth token
-	apiClient, err = apiclient.NewClient(&opts)
+	// Create authenticated client
+	apiClient, err := apiclient.NewClient(&opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create authenticated client: %w", err)
 	}
@@ -97,6 +86,34 @@ func NewClient(serverURL, username, password string, insecure bool, logger *logr
 		appClient: appClient,
 		logger:    logger,
 	}, nil
+}
+
+// createSessionToken logs in with username/password and returns a session token
+func createSessionToken(opts *apiclient.ClientOptions, username, password string, logger *logrus.Entry) (string, error) {
+	apiClient, err := apiclient.NewClient(opts)
+	if err != nil {
+		return "", fmt.Errorf("failed to create ArgoCD API client: %w", err)
+	}
+
+	closer, sessionClient, err := apiClient.NewSessionClient()
+	if err != nil {
+		return "", fmt.Errorf("failed to create session client: %w", err)
+	}
+	defer func() {
+		if err := closer.Close(); err != nil {
+			logger.WithError(err).Warn("Failed to close session client")
+		}
+	}()
+
+	sessionResp, err := sessionClient.Create(context.Background(), &session.SessionCreateRequest{
+		Username: username,
+		Password: password,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to authenticate with ArgoCD: %w", err)
+	}
+
+	return sessionResp.Token, nil
 }
 
 // FilterOptions defines filtering criteria for applications

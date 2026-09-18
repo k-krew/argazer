@@ -46,10 +46,11 @@ const (
 // Config holds the application configuration
 type Config struct {
 	// ArgoCD connection settings
-	ArgocdURL      string `mapstructure:"argocd_url"`
-	ArgocdUsername string `mapstructure:"argocd_username"`
-	ArgocdPassword string `mapstructure:"argocd_password"`
-	ArgocdInsecure bool   `mapstructure:"argocd_insecure"` // Skip TLS verification
+	ArgocdURL       string `mapstructure:"argocd_url"`
+	ArgocdAuthToken string `mapstructure:"argocd_auth_token"` // API token, used instead of username/password when set
+	ArgocdUsername  string `mapstructure:"argocd_username"`
+	ArgocdPassword  string `mapstructure:"argocd_password"`
+	ArgocdInsecure  bool   `mapstructure:"argocd_insecure"` // Skip TLS verification
 
 	// Search scope
 	Projects []string          `mapstructure:"projects"`  // List of projects to check, or ["*"] for all
@@ -140,6 +141,7 @@ func setDefaults() {
 	viper.SetDefault("fail_on", FailOnNone)
 	viper.SetDefault("log_format", LogFormatJSON)
 	viper.SetDefault("argocd_url", "")
+	viper.SetDefault("argocd_auth_token", "")
 	viper.SetDefault("argocd_username", "")
 	viper.SetDefault("argocd_password", "")
 	viper.SetDefault("notification_channel", "")
@@ -202,6 +204,13 @@ func setupEnvironment() {
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
 	viper.AutomaticEnv()
 
+	// ARGOCD_AUTH_TOKEN is the variable the ArgoCD CLI itself uses, so it is accepted
+	// without the AG_ prefix on top of the usual AG_ARGOCD_AUTH_TOKEN.
+	// Both spellings are bound because registerFlagAliases later turns the flag name
+	// into the real key behind "argocd_auth_token".
+	_ = viper.BindEnv("argocd_auth_token", "AG_ARGOCD_AUTH_TOKEN", "ARGOCD_AUTH_TOKEN")
+	_ = viper.BindEnv("argocd-auth-token", "AG_ARGOCD_AUTH_TOKEN", "ARGOCD_AUTH_TOKEN")
+
 	// Handle labels from environment variable BEFORE unmarshal
 	// Format: AG_LABELS=key1=value1,key2=value2
 	// Check if labels is set as a string (from env var) and convert it to a map
@@ -220,6 +229,7 @@ func registerFlagAliases() {
 	// RegisterAlias(alias, key) makes the alias name point to the key
 	// When unmarshal looks for "argocd_url", it will find the value stored under "argocd-url"
 	viper.RegisterAlias("argocd_url", "argocd-url")
+	viper.RegisterAlias("argocd_auth_token", "argocd-auth-token")
 	viper.RegisterAlias("argocd_username", "argocd-username")
 	viper.RegisterAlias("argocd_password", "argocd-password")
 	viper.RegisterAlias("argocd_insecure", "argocd-insecure")
@@ -237,11 +247,16 @@ func validateConfig(cfg *Config) error {
 	if cfg.ArgocdURL == "" {
 		return fmt.Errorf("argocd_url is required")
 	}
-	if cfg.ArgocdUsername == "" {
-		return fmt.Errorf("argocd_username is required")
-	}
-	if cfg.ArgocdPassword == "" {
-		return fmt.Errorf("argocd_password is required")
+	// Authentication is either a token or a username/password pair.
+	// A whitespace-only token counts as no token, and the trimmed value is what the client gets.
+	cfg.ArgocdAuthToken = strings.TrimSpace(cfg.ArgocdAuthToken)
+	if cfg.ArgocdAuthToken == "" {
+		if cfg.ArgocdUsername == "" {
+			return fmt.Errorf("argocd_username is required when argocd_auth_token is not set")
+		}
+		if cfg.ArgocdPassword == "" {
+			return fmt.Errorf("argocd_password is required when argocd_auth_token is not set")
+		}
 	}
 
 	// Validate version constraint

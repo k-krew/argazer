@@ -5,6 +5,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestContains(t *testing.T) {
@@ -58,7 +59,7 @@ func TestNewClient_InvalidURL(t *testing.T) {
 	logger := logrus.NewEntry(logrus.New())
 
 	// Test with invalid/unreachable ArgoCD server
-	_, err := NewClient("http://invalid-argocd-server-that-does-not-exist.example.com", "admin", "password", false, logger)
+	_, err := NewClient("http://invalid-argocd-server-that-does-not-exist.example.com", "admin", "password", "", false, logger)
 	// Should fail because the server doesn't exist
 	assert.Error(t, err)
 }
@@ -67,9 +68,19 @@ func TestNewClient_EmptyCredentials(t *testing.T) {
 	logger := logrus.NewEntry(logrus.New())
 
 	// Test with empty credentials
-	_, err := NewClient("http://localhost:8080", "", "", false, logger)
+	_, err := NewClient("http://localhost:8080", "", "", "", false, logger)
 	// Should fail during authentication
 	assert.Error(t, err)
+}
+
+// TestNewClient_AuthToken checks that a token short-circuits the login round-trip:
+// the client is built without ever reaching the (non-existent) server.
+func TestNewClient_AuthToken(t *testing.T) {
+	logger := logrus.NewEntry(logrus.New())
+
+	client, err := NewClient("http://invalid-argocd-server-that-does-not-exist.example.com", "", "", "some-token", false, logger)
+	require.NoError(t, err)
+	assert.NotNil(t, client)
 }
 
 func TestFilterOptions(t *testing.T) {

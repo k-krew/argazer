@@ -61,6 +61,7 @@ Exit codes: 0 - nothing to report, 1 - the scan could not be completed, 2 - upda
 	rootCmd.Flags().String("argocd-url", "", "ArgoCD server URL")
 	rootCmd.Flags().String("argocd-username", "", "ArgoCD username")
 	rootCmd.Flags().String("argocd-password", "", "ArgoCD password")
+	rootCmd.Flags().String("argocd-auth-token", "", "ArgoCD API token (alternative to username/password, also read from ARGOCD_AUTH_TOKEN)")
 	rootCmd.Flags().Bool("argocd-insecure", false, "Skip TLS verification")
 	rootCmd.Flags().StringSlice("projects", []string{"*"}, "Projects to check (comma-separated, or '*' for all)")
 	rootCmd.Flags().StringSlice("app-names", []string{"*"}, "Application names to check (comma-separated, or '*' for all)")
@@ -270,7 +271,7 @@ func initializeClients(_ context.Context, cfg *config.Config, logger *logrus.Ent
 
 	// Create ArgoCD API client
 	argoLogger := logger.WithField("component", "argocd")
-	argoClient, err := argocd.NewClient(cfg.ArgocdURL, cfg.ArgocdUsername, cfg.ArgocdPassword, cfg.ArgocdInsecure, argoLogger)
+	argoClient, err := argocd.NewClient(cfg.ArgocdURL, cfg.ArgocdUsername, cfg.ArgocdPassword, cfg.ArgocdAuthToken, cfg.ArgocdInsecure, argoLogger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create ArgoCD client: %w", err)
 	}

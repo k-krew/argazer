@@ -1,13 +1,31 @@
 package config
 
 import (
-	"os"
 	"testing"
 
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// isolateArgocdEnv clears every environment variable that can satisfy the ArgoCD
+// connection settings, so values exported on a developer machine or in CI cannot leak
+// into a test. ARGOCD_AUTH_TOKEN matters most: it has no AG_ prefix, it is commonly
+// exported for the ArgoCD CLI, and it would otherwise mask a missing username/password.
+// Viper treats an empty variable as unset, so setting the variables to "" is enough.
+func isolateArgocdEnv(t *testing.T) {
+	t.Helper()
+
+	for _, key := range []string{
+		"AG_ARGOCD_URL",
+		"AG_ARGOCD_USERNAME",
+		"AG_ARGOCD_PASSWORD",
+		"AG_ARGOCD_AUTH_TOKEN",
+		"ARGOCD_AUTH_TOKEN",
+	} {
+		t.Setenv(key, "")
+	}
+}
 
 func TestParseLabelsFromString(t *testing.T) {
 	tests := []struct {
@@ -73,53 +91,47 @@ func TestParseLabelsFromString(t *testing.T) {
 }
 
 func TestLoad_RequiredFields(t *testing.T) {
-	// Reset viper for each test
-	defer viper.Reset()
-
 	tests := []struct {
 		name        string
-		setup       func()
+		url         string
+		username    string
+		password    string
 		expectedErr string
 	}{
 		{
-			name: "missing argocd_url",
-			setup: func() {
-				viper.Reset()
-				os.Setenv("AG_ARGOCD_USERNAME", "admin")
-				os.Setenv("AG_ARGOCD_PASSWORD", "password")
-			},
+			name:        "missing argocd_url",
+			username:    "admin",
+			password:    "password",
 			expectedErr: "argocd_url is required",
 		},
 		{
-			name: "missing argocd_username",
-			setup: func() {
-				viper.Reset()
-				os.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
-				os.Setenv("AG_ARGOCD_PASSWORD", "password")
-				os.Unsetenv("AG_ARGOCD_USERNAME")
-			},
+			name:        "missing argocd_username",
+			url:         "https://argocd.example.com",
+			password:    "password",
 			expectedErr: "argocd_username is required",
 		},
 		{
-			name: "missing argocd_password",
-			setup: func() {
-				viper.Reset()
-				os.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
-				os.Setenv("AG_ARGOCD_USERNAME", "admin")
-				os.Unsetenv("AG_ARGOCD_PASSWORD")
-			},
+			name:        "missing argocd_password",
+			url:         "https://argocd.example.com",
+			username:    "admin",
 			expectedErr: "argocd_password is required",
+		},
+		{
+			name:        "missing credentials and token",
+			url:         "https://argocd.example.com",
+			expectedErr: "argocd_username is required",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tt.setup()
-			defer func() {
-				os.Unsetenv("AG_ARGOCD_URL")
-				os.Unsetenv("AG_ARGOCD_USERNAME")
-				os.Unsetenv("AG_ARGOCD_PASSWORD")
-			}()
+			defer viper.Reset()
+
+			viper.Reset()
+			isolateArgocdEnv(t)
+			t.Setenv("AG_ARGOCD_URL", tt.url)
+			t.Setenv("AG_ARGOCD_USERNAME", tt.username)
+			t.Setenv("AG_ARGOCD_PASSWORD", tt.password)
 
 			_, err := Load()
 			require.Error(t, err)
@@ -128,9 +140,136 @@ func TestLoad_RequiredFields(t *testing.T) {
 	}
 }
 
-func TestLoad_TelegramValidation(t *testing.T) {
+// TestLoad_AuthToken covers the token as a full replacement for username/password.
+func TestLoad_AuthToken(t *testing.T) {
+	tests := []struct {
+		name     string
+		envVar   string
+		username string
+		password string
+	}{
+		{
+			name:   "token only, prefixed env var",
+			envVar: "AG_ARGOCD_AUTH_TOKEN",
+		},
+		{
+			name:   "token only, ArgoCD CLI env var",
+			envVar: "ARGOCD_AUTH_TOKEN",
+		},
+		{
+			name:     "token alongside credentials",
+			envVar:   "AG_ARGOCD_AUTH_TOKEN",
+			username: "admin",
+			password: "password",
+		},
+		{
+			name:     "token with username but no password",
+			envVar:   "AG_ARGOCD_AUTH_TOKEN",
+			username: "admin",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer viper.Reset()
+
+			viper.Reset()
+			isolateArgocdEnv(t)
+			t.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
+			t.Setenv(tt.envVar, "token-abc123")
+			t.Setenv("AG_ARGOCD_USERNAME", tt.username)
+			t.Setenv("AG_ARGOCD_PASSWORD", tt.password)
+
+			cfg, err := Load()
+			require.NoError(t, err)
+			assert.Equal(t, "token-abc123", cfg.ArgocdAuthToken)
+			assert.Equal(t, tt.username, cfg.ArgocdUsername)
+			assert.Equal(t, tt.password, cfg.ArgocdPassword)
+		})
+	}
+}
+
+// TestLoad_AuthTokenPrefixWins makes sure the Argazer-specific variable takes precedence
+// over the generic one shared with the ArgoCD CLI.
+func TestLoad_AuthTokenPrefixWins(t *testing.T) {
 	defer viper.Reset()
 
+	viper.Reset()
+	isolateArgocdEnv(t)
+	t.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
+	t.Setenv("AG_ARGOCD_AUTH_TOKEN", "argazer-token")
+	t.Setenv("ARGOCD_AUTH_TOKEN", "cli-token")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "argazer-token", cfg.ArgocdAuthToken)
+}
+
+// TestLoad_AuthTokenTrimmed documents that surrounding whitespace never reaches the
+// ArgoCD client, and that a token made of whitespace only is treated as no token at all.
+func TestLoad_AuthTokenTrimmed(t *testing.T) {
+	tests := []struct {
+		name          string
+		token         string
+		expectedToken string
+		expectedErr   string
+	}{
+		{
+			name:          "padded token is trimmed",
+			token:         "  token-abc123\n",
+			expectedToken: "token-abc123",
+		},
+		{
+			name:        "whitespace-only token is not a token",
+			token:       "   ",
+			expectedErr: "argocd_username is required when argocd_auth_token is not set",
+		},
+		{
+			name:        "tab-only token is not a token",
+			token:       "\t",
+			expectedErr: "argocd_username is required when argocd_auth_token is not set",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer viper.Reset()
+
+			viper.Reset()
+			isolateArgocdEnv(t)
+			t.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
+			t.Setenv("AG_ARGOCD_AUTH_TOKEN", tt.token)
+
+			cfg, err := Load()
+			if tt.expectedErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.expectedErr)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.expectedToken, cfg.ArgocdAuthToken)
+		})
+	}
+}
+
+// TestLoad_NoAuthToken keeps username/password mandatory when no token is provided.
+func TestLoad_NoAuthToken(t *testing.T) {
+	defer viper.Reset()
+
+	viper.Reset()
+	isolateArgocdEnv(t)
+	t.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
+	t.Setenv("AG_ARGOCD_USERNAME", "admin")
+	t.Setenv("AG_ARGOCD_PASSWORD", "password")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.ArgocdAuthToken)
+	assert.Equal(t, "admin", cfg.ArgocdUsername)
+}
+
+func TestLoad_TelegramValidation(t *testing.T) {
 	tests := []struct {
 		name        string
 		webhook     string
@@ -153,26 +292,16 @@ func TestLoad_TelegramValidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			viper.Reset()
-			os.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
-			os.Setenv("AG_ARGOCD_USERNAME", "admin")
-			os.Setenv("AG_ARGOCD_PASSWORD", "password")
-			os.Setenv("AG_NOTIFICATION_CHANNEL", "telegram")
-			if tt.webhook != "" {
-				os.Setenv("AG_TELEGRAM_WEBHOOK", tt.webhook)
-			}
-			if tt.chatID != "" {
-				os.Setenv("AG_TELEGRAM_CHAT_ID", tt.chatID)
-			}
+			defer viper.Reset()
 
-			defer func() {
-				os.Unsetenv("AG_ARGOCD_URL")
-				os.Unsetenv("AG_ARGOCD_USERNAME")
-				os.Unsetenv("AG_ARGOCD_PASSWORD")
-				os.Unsetenv("AG_NOTIFICATION_CHANNEL")
-				os.Unsetenv("AG_TELEGRAM_WEBHOOK")
-				os.Unsetenv("AG_TELEGRAM_CHAT_ID")
-			}()
+			viper.Reset()
+			isolateArgocdEnv(t)
+			t.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
+			t.Setenv("AG_ARGOCD_USERNAME", "admin")
+			t.Setenv("AG_ARGOCD_PASSWORD", "password")
+			t.Setenv("AG_NOTIFICATION_CHANNEL", "telegram")
+			t.Setenv("AG_TELEGRAM_WEBHOOK", tt.webhook)
+			t.Setenv("AG_TELEGRAM_CHAT_ID", tt.chatID)
 
 			_, err := Load()
 			require.Error(t, err)
@@ -182,8 +311,6 @@ func TestLoad_TelegramValidation(t *testing.T) {
 }
 
 func TestLoad_EmailValidation(t *testing.T) {
-	defer viper.Reset()
-
 	tests := []struct {
 		name        string
 		smtpHost    string
@@ -216,30 +343,17 @@ func TestLoad_EmailValidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			viper.Reset()
-			os.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
-			os.Setenv("AG_ARGOCD_USERNAME", "admin")
-			os.Setenv("AG_ARGOCD_PASSWORD", "password")
-			os.Setenv("AG_NOTIFICATION_CHANNEL", "email")
-			if tt.smtpHost != "" {
-				os.Setenv("AG_EMAIL_SMTP_HOST", tt.smtpHost)
-			}
-			if tt.from != "" {
-				os.Setenv("AG_EMAIL_FROM", tt.from)
-			}
-			if tt.to != "" {
-				os.Setenv("AG_EMAIL_TO", tt.to)
-			}
+			defer viper.Reset()
 
-			defer func() {
-				os.Unsetenv("AG_ARGOCD_URL")
-				os.Unsetenv("AG_ARGOCD_USERNAME")
-				os.Unsetenv("AG_ARGOCD_PASSWORD")
-				os.Unsetenv("AG_NOTIFICATION_CHANNEL")
-				os.Unsetenv("AG_EMAIL_SMTP_HOST")
-				os.Unsetenv("AG_EMAIL_FROM")
-				os.Unsetenv("AG_EMAIL_TO")
-			}()
+			viper.Reset()
+			isolateArgocdEnv(t)
+			t.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
+			t.Setenv("AG_ARGOCD_USERNAME", "admin")
+			t.Setenv("AG_ARGOCD_PASSWORD", "password")
+			t.Setenv("AG_NOTIFICATION_CHANNEL", "email")
+			t.Setenv("AG_EMAIL_SMTP_HOST", tt.smtpHost)
+			t.Setenv("AG_EMAIL_FROM", tt.from)
+			t.Setenv("AG_EMAIL_TO", tt.to)
 
 			_, err := Load()
 			require.Error(t, err)
@@ -252,25 +366,15 @@ func TestLoad_Success(t *testing.T) {
 	defer viper.Reset()
 
 	viper.Reset()
-	os.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
-	os.Setenv("AG_ARGOCD_USERNAME", "admin")
-	os.Setenv("AG_ARGOCD_PASSWORD", "password123")
-	os.Setenv("AG_ARGOCD_INSECURE", "true")
-	os.Setenv("AG_VERBOSITY", "full")
-	os.Setenv("AG_CONCURRENCY", "20")
-	os.Setenv("AG_SOURCE_NAME", "my-chart")
-	os.Setenv("AG_LABELS", "env=prod,team=platform")
-
-	defer func() {
-		os.Unsetenv("AG_ARGOCD_URL")
-		os.Unsetenv("AG_ARGOCD_USERNAME")
-		os.Unsetenv("AG_ARGOCD_PASSWORD")
-		os.Unsetenv("AG_ARGOCD_INSECURE")
-		os.Unsetenv("AG_VERBOSITY")
-		os.Unsetenv("AG_CONCURRENCY")
-		os.Unsetenv("AG_SOURCE_NAME")
-		os.Unsetenv("AG_LABELS")
-	}()
+	isolateArgocdEnv(t)
+	t.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
+	t.Setenv("AG_ARGOCD_USERNAME", "admin")
+	t.Setenv("AG_ARGOCD_PASSWORD", "password123")
+	t.Setenv("AG_ARGOCD_INSECURE", "true")
+	t.Setenv("AG_VERBOSITY", "full")
+	t.Setenv("AG_CONCURRENCY", "20")
+	t.Setenv("AG_SOURCE_NAME", "my-chart")
+	t.Setenv("AG_LABELS", "env=prod,team=platform")
 
 	cfg, err := Load()
 	require.NoError(t, err)
@@ -290,15 +394,10 @@ func TestLoad_Defaults(t *testing.T) {
 	defer viper.Reset()
 
 	viper.Reset()
-	os.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
-	os.Setenv("AG_ARGOCD_USERNAME", "admin")
-	os.Setenv("AG_ARGOCD_PASSWORD", "password")
-
-	defer func() {
-		os.Unsetenv("AG_ARGOCD_URL")
-		os.Unsetenv("AG_ARGOCD_USERNAME")
-		os.Unsetenv("AG_ARGOCD_PASSWORD")
-	}()
+	isolateArgocdEnv(t)
+	t.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
+	t.Setenv("AG_ARGOCD_USERNAME", "admin")
+	t.Setenv("AG_ARGOCD_PASSWORD", "password")
 
 	cfg, err := Load()
 	require.NoError(t, err)
@@ -334,17 +433,11 @@ func TestLoad_FailOnValidation(t *testing.T) {
 			defer viper.Reset()
 
 			viper.Reset()
-			os.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
-			os.Setenv("AG_ARGOCD_USERNAME", "admin")
-			os.Setenv("AG_ARGOCD_PASSWORD", "password")
-			os.Setenv("AG_FAIL_ON", tt.failOn)
-
-			defer func() {
-				os.Unsetenv("AG_ARGOCD_URL")
-				os.Unsetenv("AG_ARGOCD_USERNAME")
-				os.Unsetenv("AG_ARGOCD_PASSWORD")
-				os.Unsetenv("AG_FAIL_ON")
-			}()
+			isolateArgocdEnv(t)
+			t.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
+			t.Setenv("AG_ARGOCD_USERNAME", "admin")
+			t.Setenv("AG_ARGOCD_PASSWORD", "password")
+			t.Setenv("AG_FAIL_ON", tt.failOn)
 
 			cfg, err := Load()
 			if tt.expectedErr != "" {
@@ -365,17 +458,11 @@ func TestLoad_FailOnEmpty(t *testing.T) {
 	defer viper.Reset()
 
 	viper.Reset()
-	os.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
-	os.Setenv("AG_ARGOCD_USERNAME", "admin")
-	os.Setenv("AG_ARGOCD_PASSWORD", "password")
-	os.Setenv("AG_FAIL_ON", "")
-
-	defer func() {
-		os.Unsetenv("AG_ARGOCD_URL")
-		os.Unsetenv("AG_ARGOCD_USERNAME")
-		os.Unsetenv("AG_ARGOCD_PASSWORD")
-		os.Unsetenv("AG_FAIL_ON")
-	}()
+	isolateArgocdEnv(t)
+	t.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
+	t.Setenv("AG_ARGOCD_USERNAME", "admin")
+	t.Setenv("AG_ARGOCD_PASSWORD", "password")
+	t.Setenv("AG_FAIL_ON", "")
 
 	cfg, err := Load()
 	require.NoError(t, err)
