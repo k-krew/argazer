@@ -3,11 +3,13 @@ package argocd
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/argoproj/argo-cd/v2/pkg/apiclient"
 	"github.com/argoproj/argo-cd/v2/pkg/apiclient/application"
@@ -17,33 +19,50 @@ import (
 	reposerver "github.com/argoproj/argo-cd/v2/reposerver/apiclient"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-// helmChartLister is the single call Argazer needs from the ArgoCD repository service.
-type helmChartLister interface {
+// repositoryService holds the calls Argazer needs from the ArgoCD repository service:
+// the charts of a Helm repository and the refs of a Git repository.
+type repositoryService interface {
 	GetHelmCharts(ctx context.Context, in *repository.RepoQuery, opts ...grpc.CallOption) (*reposerver.HelmChartsResponse, error)
+	ListRefs(ctx context.Context, in *repository.RepoQuery, opts ...grpc.CallOption) (*reposerver.Refs, error)
 }
 
-// helmChartsCacheKey identifies a cached ArgoCD helmcharts response. The project is part
-// of the key because the same URL can resolve with different credentials, and therefore
-// to a different set of charts, depending on the project of the asking application.
-type helmChartsCacheKey struct {
-	repoURL string
-	project string
+// ociTagLister lists the tags of an OCI artifact through ArgoCD.
+type ociTagLister interface {
+	ListOCITags(ctx context.Context, artifact, project string) ([]string, error)
 }
+
+// Requests for a repository are retried before their error is handed to every caller
+// waiting for them. Without retries a single hiccup of the repo-server skips a repository
+// for the whole run, and a hiccup is likely exactly when Argazer starts its workers and
+// asks for every repository at once.
+const (
+	repoRequestAttempts = 3
+	// defaultRetryBackoff is the delay before the second attempt, doubled for each
+	// further one.
+	defaultRetryBackoff = 500 * time.Millisecond
+)
 
 // Client wraps ArgoCD API client
 type Client struct {
 	apiClient  apiclient.Client
 	appClient  application.ApplicationServiceClient
-	repoClient helmChartLister
+	repoClient repositoryService
+	ociClient  ociTagLister
 	logger     *logrus.Entry
 
-	// helmChartsCache maps helmChartsCacheKey to *helmChartsCacheEntry and lives only
-	// for the duration of the run. Every GetHelmCharts call makes the ArgoCD
-	// repo-server download and parse the whole index.yaml of a repository, so hundreds
-	// of applications sharing a repository must not turn into hundreds of requests.
-	helmChartsCache sync.Map
+	// retryBackoff overrides defaultRetryBackoff, which is what a zero value means. It
+	// exists so that tests do not have to wait for real backoffs.
+	retryBackoff time.Duration
+
+	// repoCache maps a repoCacheKey to the *repoCacheEntry holding the answer of ArgoCD,
+	// and lives only for the duration of the run. Every request makes the ArgoCD
+	// repo-server reach out to the repository, so hundreds of applications sharing a
+	// repository must not turn into hundreds of requests.
+	repoCache sync.Map
 }
 
 // NewClient creates a new ArgoCD API client.
@@ -61,16 +80,6 @@ func NewClient(serverURL, username, password, authToken string, insecure bool, l
 		"auth_method": authMethod,
 	}).Info("Creating ArgoCD API client")
 
-	// Create HTTP client with optional TLS skip verification
-	var httpClient *http.Client
-	if insecure {
-		httpClient = &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-		}
-	}
-
 	// Create ArgoCD client options
 	opts := apiclient.ClientOptions{
 		ServerAddr: serverURL,
@@ -78,8 +87,6 @@ func NewClient(serverURL, username, password, authToken string, insecure bool, l
 		Insecure:   insecure,
 		GRPCWeb:    true, // Use gRPC-Web mode to avoid warnings and support HTTP proxies
 	}
-
-	_ = httpClient // Will be used for direct HTTP calls if needed
 
 	// Without a token, exchange username/password for a session token
 	if authToken == "" {
@@ -110,13 +117,34 @@ func NewClient(serverURL, username, password, authToken string, insecure bool, l
 		return nil, fmt.Errorf("failed to create repository client: %w", err)
 	}
 
+	// OCI tags are read over REST, see ociTagsClient. Every request bounds itself, so the
+	// client has no timeout of its own, see ociTagsRequestTimeout.
+	httpClient := &http.Client{}
+	if insecure {
+		// The default transport is cloned rather than replaced so that everything else it
+		// does, proxies from the environment above all, keeps working.
+		transport, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			return nil, fmt.Errorf("cannot skip TLS verification: the default HTTP transport is a %T", http.DefaultTransport)
+		}
+
+		insecureTransport := transport.Clone()
+		insecureTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // asked for by --argocd-insecure
+		httpClient.Transport = insecureTransport
+	}
+
 	logger.Info("Successfully created ArgoCD API client")
 
 	return &Client{
 		apiClient:  apiClient,
 		appClient:  appClient,
 		repoClient: repoClient,
-		logger:     logger,
+		ociClient: &ociTagsClient{
+			baseURL:    restBaseURL(serverURL),
+			authToken:  authToken,
+			httpClient: httpClient,
+		},
+		logger: logger,
 	}, nil
 }
 
@@ -234,9 +262,15 @@ func (c *Client) GetHelmChartVersions(ctx context.Context, repoURL, chartName, p
 		"project": project,
 	}).Debug("Fetching Helm chart versions from ArgoCD")
 
-	charts, err := c.helmChartsOfRepository(ctx, repoURL, project)
+	charts, err := cachedRepoRequest(ctx, c, helmChartsKey{repoURL: repoURL, project: project},
+		func(ctx context.Context) (*reposerver.HelmChartsResponse, error) {
+			return c.repoClient.GetHelmCharts(ctx, &repository.RepoQuery{
+				Repo:       repoURL,
+				AppProject: project,
+			})
+		})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get Helm charts of repository %s: %w", repoURL, err)
 	}
 
 	// The response is shared by every caller of the repository, so callers get a copy
@@ -253,61 +287,280 @@ func (c *Client) GetHelmChartVersions(ctx context.Context, repoURL, chartName, p
 	return versions, nil
 }
 
-// helmChartsOfRepository returns every chart ArgoCD reports for a repository, asking
-// ArgoCD once per repository and project and serving later callers from the cache.
+// GetOCITags returns the tags ArgoCD reports for the OCI artifact holding a chart. The
+// tags carry no chart metadata, so they are returned as they are and it is up to the
+// caller to decide which of them are versions.
+//
+// project must be the ArgoCD project of the application that uses the chart, for the same
+// reason as in GetHelmChartVersions.
+func (c *Client) GetOCITags(ctx context.Context, repoURL, chartName, project string) ([]string, error) {
+	artifact := ociArtifact(repoURL, chartName)
+
+	c.logger.WithFields(logrus.Fields{
+		"artifact": artifact,
+		"project":  project,
+	}).Debug("Fetching OCI tags from ArgoCD")
+
+	tags, err := cachedRepoRequest(ctx, c, ociTagsKey{artifact: artifact, project: project},
+		func(ctx context.Context) ([]string, error) {
+			return c.ociClient.ListOCITags(ctx, artifact, project)
+		})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get the OCI tags of %s: %w", artifact, err)
+	}
+
+	c.logger.WithFields(logrus.Fields{
+		"artifact":   artifact,
+		"project":    project,
+		"tags_count": len(tags),
+	}).Debug("Received OCI tags from ArgoCD")
+
+	// The cached tags are shared by every caller of the artifact, so callers get a copy
+	// they are free to modify.
+	return slices.Clone(tags), nil
+}
+
+// GetGitTags returns the tags ArgoCD reports for a Git repository. Charts kept in Git have
+// no version list of their own, so their versions are whatever the tags say, and it is up
+// to the caller to decide which of them are versions.
+//
+// project must be the ArgoCD project of the application that uses the repository, for the
+// same reason as in GetHelmChartVersions.
+func (c *Client) GetGitTags(ctx context.Context, repoURL, project string) ([]string, error) {
+	c.logger.WithFields(logrus.Fields{
+		"repo":    repoURL,
+		"project": project,
+	}).Debug("Fetching Git tags from ArgoCD")
+
+	refs, err := cachedRepoRequest(ctx, c, gitRefsKey{repoURL: repoURL, project: project},
+		func(ctx context.Context) (*reposerver.Refs, error) {
+			return c.repoClient.ListRefs(ctx, &repository.RepoQuery{
+				Repo:       repoURL,
+				AppProject: project,
+			})
+		})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get the refs of Git repository %s: %w", repoURL, err)
+	}
+
+	c.logger.WithFields(logrus.Fields{
+		"repo":       repoURL,
+		"project":    project,
+		"tags_count": len(refs.GetTags()),
+	}).Debug("Received Git tags from ArgoCD")
+
+	// The cached response is shared by every caller of the repository, so callers get a
+	// copy they are free to modify.
+	return slices.Clone(refs.GetTags()), nil
+}
+
+// ociArtifact builds the reference of the OCI artifact holding a chart, which is what
+// ArgoCD lists the tags of.
+//
+// The repository URL is passed on exactly as the Application spells it, because that same
+// string is what ArgoCD looks its credentials up by, and it matches a registered
+// repository only as a whole. Dropping the oci:// scheme, for one, would turn a repository
+// registered as "oci://ghcr.io/myorg/nginx" into an unknown one, and ArgoCD would fall
+// back to an anonymous request the registry rejects.
+//
+// A source with the scheme is an OCI source to ArgoCD: its URL already names the artifact
+// and a chart name, should the Application carry one, is not part of the reference. A
+// source without it is a Helm source, which names the registry path and the chart
+// separately the way Helm does, so chart "nginx" of "ghcr.io/myorg/charts" lives in
+// "ghcr.io/myorg/charts/nginx".
+func ociArtifact(repoURL, chartName string) string {
+	if strings.HasPrefix(repoURL, "oci://") {
+		return strings.TrimSuffix(repoURL, "/")
+	}
+
+	artifact := strings.Trim(repoURL, "/")
+	chartName = strings.Trim(chartName, "/")
+	if chartName == "" {
+		return artifact
+	}
+
+	return artifact + "/" + chartName
+}
+
+// Cache keys of the repository requests. Every kind of request has its own key type, which
+// both keeps the entries of different requests apart within one cache and makes the type of
+// a cached value follow from the type of its key.
+type (
+	// helmChartsKey identifies the charts of a Helm repository. The project is part of
+	// every key because the same URL can resolve with different credentials, and
+	// therefore to a different answer, depending on the project of the asking
+	// application.
+	helmChartsKey struct {
+		repoURL string
+		project string
+	}
+
+	// ociTagsKey identifies the tags of an OCI artifact.
+	ociTagsKey struct {
+		artifact string
+		project  string
+	}
+
+	// gitRefsKey identifies the refs of a Git repository.
+	gitRefsKey struct {
+		repoURL string
+		project string
+	}
+)
+
+func (k helmChartsKey) String() string {
+	return fmt.Sprintf("Helm charts of %s (project %q)", k.repoURL, k.project)
+}
+
+func (k ociTagsKey) String() string {
+	return fmt.Sprintf("OCI tags of %s (project %q)", k.artifact, k.project)
+}
+
+func (k gitRefsKey) String() string {
+	return fmt.Sprintf("Git refs of %s (project %q)", k.repoURL, k.project)
+}
+
+// repoCacheKey identifies a cached answer of ArgoCD, and names the request it belongs to
+// for the logs.
+type repoCacheKey interface {
+	String() string
+}
+
+// cachedRepoRequest asks ArgoCD once per key and serves every later caller from the cache.
 //
 // Callers run in parallel worker goroutines, so a cache lookup alone is not enough: the
-// first callers would all miss it at the same time and all hit ArgoCD. Callers that
-// arrive while a repository is being fetched therefore wait for that single in-flight
-// request instead of starting their own.
-func (c *Client) helmChartsOfRepository(ctx context.Context, repoURL, project string) (*reposerver.HelmChartsResponse, error) {
-	key := helmChartsCacheKey{repoURL: repoURL, project: project}
+// first callers would all miss it at the same time and all hit ArgoCD. Callers that arrive
+// while a request is in flight therefore wait for that single request instead of starting
+// their own, which also means the retries of that request cover all of them.
+func cachedRepoRequest[T any](ctx context.Context, c *Client, key repoCacheKey, request func(context.Context) (T, error)) (T, error) {
+	entry := &repoCacheEntry[T]{ready: make(chan struct{})}
+	if cached, loaded := c.repoCache.LoadOrStore(key, entry); loaded {
+		c.logger.WithField("request", key.String()).Debug("Reusing the cached answer of ArgoCD")
 
-	entry := &helmChartsCacheEntry{ready: make(chan struct{})}
-	if cached, loaded := c.helmChartsCache.LoadOrStore(key, entry); loaded {
-		c.logger.WithFields(logrus.Fields{
-			"repo":    repoURL,
-			"project": project,
-		}).Debug("Reusing the cached Helm charts of the repository")
+		// Only requests of one kind use a given key type, so the entry of a key always
+		// holds the type its request returns.
+		waiting, ok := cached.(*repoCacheEntry[T])
+		if !ok {
+			var zero T
+			return zero, fmt.Errorf("cached answer for %s holds %T instead of %T", key, cached, entry)
+		}
 
-		return cached.(*helmChartsCacheEntry).wait(ctx)
+		return waiting.wait(ctx)
 	}
 
 	// This goroutine stored the entry, so it owns the single request to ArgoCD.
-	charts, err := c.repoClient.GetHelmCharts(ctx, &repository.RepoQuery{
-		Repo:       repoURL,
-		AppProject: project,
-	})
+	value, err := requestWithRetries(ctx, c, key, request)
 	if err != nil {
-		// A failure is not worth caching: it can be a cancelled context or a
-		// temporary ArgoCD problem, and the next application must be free to retry.
-		c.helmChartsCache.Delete(key)
-		err = fmt.Errorf("failed to get Helm charts of repository %s: %w", repoURL, err)
+		// A failure is not worth caching: it can be a cancelled context or a temporary
+		// ArgoCD problem, and the next application must be free to retry.
+		c.repoCache.Delete(key)
 	}
 
-	entry.charts, entry.err = charts, err
+	entry.value, entry.err = value, err
 	close(entry.ready)
 
-	return charts, err
+	return value, err
 }
 
-// helmChartsCacheEntry holds the outcome of one GetHelmCharts call. ready is closed once
-// charts and err are written, which is what makes them safe to read from other
-// goroutines.
-type helmChartsCacheEntry struct {
-	ready  chan struct{}
-	charts *reposerver.HelmChartsResponse
-	err    error
+// requestWithRetries repeats a failed request to ArgoCD, giving it a growing pause to
+// recover. Errors that a retry cannot change are reported right away.
+func requestWithRetries[T any](ctx context.Context, c *Client, key repoCacheKey, request func(context.Context) (T, error)) (T, error) {
+	for attempt := 1; ; attempt++ {
+		value, err := request(ctx)
+		if err == nil {
+			return value, nil
+		}
+
+		if attempt == repoRequestAttempts || !worthRetrying(ctx, err) {
+			var zero T
+			return zero, err
+		}
+
+		delay := c.retryDelay(attempt)
+		c.logger.WithError(err).WithFields(logrus.Fields{
+			"request":  key.String(),
+			"attempt":  attempt,
+			"attempts": repoRequestAttempts,
+			"retry_in": delay.String(),
+		}).Warn("Request to ArgoCD failed, retrying")
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			// The caller gave up, which is the outcome it should hear about rather than
+			// the failure that was about to be retried.
+			timer.Stop()
+
+			var zero T
+			return zero, ctx.Err()
+		}
+	}
+}
+
+// retryDelay is how long to wait after the given attempt, doubling with every attempt so
+// that a busy repo-server gets more room each time.
+func (c *Client) retryDelay(attempt int) time.Duration {
+	backoff := c.retryBackoff
+	if backoff <= 0 {
+		backoff = defaultRetryBackoff
+	}
+
+	return backoff << (attempt - 1)
+}
+
+// worthRetrying reports whether repeating a failed request can plausibly succeed. A
+// repository that does not exist, or a token that is not allowed to read it, answers the
+// same way every time, while a timeout or a restarting repo-server does not.
+//
+// ctx is the context of the caller, and is what tells the two kinds of expired deadline
+// apart. A request that ran into the deadline of its own attempt is worth repeating, while
+// one that ended because the run itself is over is not, and both report the same error.
+func worthRetrying(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+
+	var responseErr *responseStatusError
+	if errors.As(err, &responseErr) {
+		return responseErr.worthRetrying()
+	}
+
+	if grpcStatus, ok := status.FromError(err); ok && slices.Contains(permanentCodes, grpcStatus.Code()) {
+		return false
+	}
+
+	return true
+}
+
+// permanentCodes are the answers of ArgoCD that say the request itself is wrong, rather
+// than that ArgoCD is momentarily unable to serve it.
+var permanentCodes = []codes.Code{
+	codes.NotFound,
+	codes.PermissionDenied,
+	codes.Unauthenticated,
+	codes.InvalidArgument,
+	codes.Unimplemented,
+	codes.FailedPrecondition,
+}
+
+// repoCacheEntry holds the outcome of one request to ArgoCD. ready is closed once value
+// and err are written, which is what makes them safe to read from other goroutines.
+type repoCacheEntry[T any] struct {
+	ready chan struct{}
+	value T
+	err   error
 }
 
 // wait blocks until the request owning the entry has finished, and reports the outcome it
 // got. It gives up when the caller's own context is cancelled.
-func (e *helmChartsCacheEntry) wait(ctx context.Context) (*reposerver.HelmChartsResponse, error) {
+func (e *repoCacheEntry[T]) wait(ctx context.Context) (T, error) {
 	select {
 	case <-e.ready:
-		return e.charts, e.err
+		return e.value, e.err
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		var zero T
+		return zero, ctx.Err()
 	}
 }
 

@@ -69,6 +69,13 @@ func findLatestSemver(versions []string, logger *logrus.Entry) (string, error) {
 	return validVersions[0].original, nil
 }
 
+// isSemver reports whether a string holds a version the checker can compare.
+func isSemver(version string) bool {
+	_, err := semver.NewVersion(version)
+
+	return err == nil
+}
+
 // versionPair keeps a parsed version alongside the string it came from, so the
 // original representation (e.g. with a "v" prefix) can be returned unchanged.
 type versionPair struct {

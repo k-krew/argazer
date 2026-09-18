@@ -3,32 +3,34 @@ package helm
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/sirupsen/logrus"
 )
 
-// ChartVersionSource reports the versions available for a chart in a Helm repository.
-// It is implemented by the ArgoCD client: ArgoCD already holds the repository
-// credentials, so Argazer reads versions through its API instead of pulling index.yaml
-// itself. An empty result means the repository holds no such chart.
+// ChartVersionSource reports what versions of a chart a repository holds. It is implemented
+// by the ArgoCD client: ArgoCD already holds the repository credentials, so Argazer reads
+// versions through its API instead of reaching the repository itself. An empty result means
+// the repository is reachable but holds no such chart.
 //
 // project is the ArgoCD project of the application that uses the chart. It is required to
 // reach repositories whose credentials are scoped to a project instead of registered
 // globally; for globally registered repositories it can be empty.
 type ChartVersionSource interface {
+	// GetHelmChartVersions returns the chart versions of a classic Helm repository.
 	GetHelmChartVersions(ctx context.Context, repoURL, chartName, project string) ([]string, error)
+	// GetOCITags returns the tags of the OCI artifact holding the chart.
+	GetOCITags(ctx context.Context, repoURL, chartName, project string) ([]string, error)
+	// GetGitTags returns the tags of a Git repository holding charts.
+	GetGitTags(ctx context.Context, repoURL, project string) ([]string, error)
 }
 
 // Checker checks Helm repositories for new chart versions
 type Checker struct {
 	versionSource ChartVersionSource
-	ociChecker    *OCIChecker
-	gitClient     *GitClient
 	logger        *logrus.Entry
 }
 
-// NewChecker creates a new Helm checker. Versions of classic Helm repositories come from
+// NewChecker creates a new Helm checker. Versions of every kind of repository come from
 // versionSource, usually the ArgoCD client.
 func NewChecker(versionSource ChartVersionSource, logger *logrus.Entry) (*Checker, error) {
 	if versionSource == nil {
@@ -37,8 +39,6 @@ func NewChecker(versionSource ChartVersionSource, logger *logrus.Entry) (*Checke
 
 	return &Checker{
 		versionSource: versionSource,
-		ociChecker:    NewOCIChecker(logger.WithField("type", "oci")),
-		gitClient:     NewGitClient("", "", logger.WithField("type", "git")),
 		logger:        logger,
 	}, nil
 }
@@ -46,93 +46,11 @@ func NewChecker(versionSource ChartVersionSource, logger *logrus.Entry) (*Checke
 // GetLatestVersion gets the latest version of a Helm chart from a repository.
 // project is the ArgoCD project of the application, needed for project-scoped repositories.
 func (c *Checker) GetLatestVersion(ctx context.Context, repoURL, chartName, project string) (string, error) {
-	// Check if this is a Git repository
-	if isGitURL(repoURL) {
-		c.logger.WithFields(logrus.Fields{
-			"repo":  repoURL,
-			"chart": chartName,
-		}).Info("Detected Git repository, using Git checker")
-
-		// Use chartName as the path within the repo
-		return c.gitClient.GetLatestVersion(ctx, repoURL, chartName)
-	}
-
-	// Check if this is an OCI repository (no http/https prefix)
-	if !strings.HasPrefix(repoURL, "http://") && !strings.HasPrefix(repoURL, "https://") {
-		c.logger.WithFields(logrus.Fields{
-			"repo":  repoURL,
-			"chart": chartName,
-		}).Info("Detected OCI repository, using OCI checker")
-		return c.ociChecker.GetLatestVersion(ctx, repoURL, chartName)
-	}
-	return c.getLatestVersionFromRepo(ctx, repoURL, chartName, project)
-}
-
-// GetLatestVersionWithConstraint gets the latest version respecting the version constraint.
-// project is the ArgoCD project of the application, needed for project-scoped repositories.
-func (c *Checker) GetLatestVersionWithConstraint(ctx context.Context, repoURL, chartName, project, currentVersion, constraint string) (*VersionConstraintResult, error) {
-	// Check if this is a Git repository
-	if isGitURL(repoURL) {
-		c.logger.WithFields(logrus.Fields{
-			"repo":       repoURL,
-			"chart":      chartName,
-			"constraint": constraint,
-		}).Info("Detected Git repository, using Git checker with constraint")
-
-		// Get all versions from Git tags
-		versions, err := c.gitClient.GetAllVersions(ctx, repoURL, chartName)
-		if err != nil {
-			return nil, err
-		}
-
-		// Apply constraint logic
-		return findLatestSemverWithConstraint(versions, currentVersion, constraint, c.logger)
-	}
-
-	// Check if this is an OCI repository (no http/https prefix)
-	if !strings.HasPrefix(repoURL, "http://") && !strings.HasPrefix(repoURL, "https://") {
-		c.logger.WithFields(logrus.Fields{
-			"repo":  repoURL,
-			"chart": chartName,
-		}).Info("Detected OCI repository, using OCI checker")
-		// Use OCI checker with constraint support
-		return c.ociChecker.GetLatestVersionWithConstraint(ctx, repoURL, chartName, currentVersion, constraint)
-	}
-
-	return c.getLatestVersionFromRepoWithConstraint(ctx, repoURL, chartName, project, currentVersion, constraint)
-}
-
-// getChartVersionsFromRepo returns all versions ArgoCD reports for a chart in a Helm
-// repository.
-func (c *Checker) getChartVersionsFromRepo(ctx context.Context, repoURL, chartName, project string) ([]string, error) {
-	c.logger.WithFields(logrus.Fields{
-		"repo":    repoURL,
-		"chart":   chartName,
-		"project": project,
-	}).Debug("Asking ArgoCD for the chart versions of a Helm repository")
-
-	versions, err := c.versionSource.GetHelmChartVersions(ctx, repoURL, chartName, project)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get chart versions from ArgoCD: %w", err)
-	}
-
-	// ArgoCD answers with the charts of the whole repository, so a chart it does not
-	// mention is a chart the repository does not have.
-	if len(versions) == 0 {
-		return nil, fmt.Errorf("%w: %s in %s", ErrChartNotFound, chartName, repoURL)
-	}
-
-	return versions, nil
-}
-
-func (c *Checker) getLatestVersionFromRepo(ctx context.Context, repoURL, chartName, project string) (string, error) {
-	// Fetch all versions
-	versions, err := c.getChartVersionsFromRepo(ctx, repoURL, chartName, project)
+	versions, err := c.chartVersions(ctx, repoURL, chartName, project)
 	if err != nil {
 		return "", err
 	}
 
-	// Use shared utility function for finding latest semantic version
 	latestVersion, err := findLatestSemver(versions, c.logger)
 	if err != nil {
 		return "", fmt.Errorf("failed to determine latest version: %w", err)
@@ -147,15 +65,14 @@ func (c *Checker) getLatestVersionFromRepo(ctx context.Context, repoURL, chartNa
 	return latestVersion, nil
 }
 
-// getLatestVersionFromRepoWithConstraint gets the latest version with constraint support
-func (c *Checker) getLatestVersionFromRepoWithConstraint(ctx context.Context, repoURL, chartName, project, currentVersion, constraint string) (*VersionConstraintResult, error) {
-	// Fetch all versions using shared helper
-	versions, err := c.getChartVersionsFromRepo(ctx, repoURL, chartName, project)
+// GetLatestVersionWithConstraint gets the latest version respecting the version constraint.
+// project is the ArgoCD project of the application, needed for project-scoped repositories.
+func (c *Checker) GetLatestVersionWithConstraint(ctx context.Context, repoURL, chartName, project, currentVersion, constraint string) (*VersionConstraintResult, error) {
+	versions, err := c.chartVersions(ctx, repoURL, chartName, project)
 	if err != nil {
 		return nil, err
 	}
 
-	// Apply constraint filtering
 	result, err := findLatestSemverWithConstraint(versions, currentVersion, constraint, c.logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to determine latest version: %w", err)
@@ -172,4 +89,62 @@ func (c *Checker) getLatestVersionFromRepoWithConstraint(ctx context.Context, re
 	}).Debug("Found latest version with constraint")
 
 	return result, nil
+}
+
+// chartVersions returns the versions available for a chart, asking ArgoCD in the way that
+// fits the kind of repository the chart comes from. Whatever the kind, ArgoCD is the one
+// talking to the repository, so private Git repositories and OCI registries need no
+// credentials in Argazer.
+func (c *Checker) chartVersions(ctx context.Context, repoURL, chartName, project string) ([]string, error) {
+	logger := c.logger.WithFields(logrus.Fields{
+		"repo":    repoURL,
+		"chart":   chartName,
+		"project": project,
+	})
+
+	var versions []string
+
+	switch {
+	case isGitURL(repoURL):
+		logger.Debug("Asking ArgoCD for the tags of a Git repository")
+
+		tags, err := c.versionSource.GetGitTags(ctx, repoURL, project)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get Git tags from ArgoCD: %w", err)
+		}
+
+		// A chart in Git is a directory, and its releases are tags of the whole
+		// repository, so the tags belonging to other charts have to be left out.
+		versions = gitTagVersions(tags, chartName)
+
+	case isOCIURL(repoURL):
+		logger.Debug("Asking ArgoCD for the tags of an OCI artifact")
+
+		// An OCI tag is the chart version, and tags that are no version at all (such as
+		// "latest") are dropped later, when the versions are parsed.
+		tags, err := c.versionSource.GetOCITags(ctx, repoURL, chartName, project)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get OCI tags from ArgoCD: %w", err)
+		}
+
+		versions = tags
+
+	default:
+		logger.Debug("Asking ArgoCD for the chart versions of a Helm repository")
+
+		helmVersions, err := c.versionSource.GetHelmChartVersions(ctx, repoURL, chartName, project)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get chart versions from ArgoCD: %w", err)
+		}
+
+		versions = helmVersions
+	}
+
+	// ArgoCD answers with everything a repository holds, so a chart it says nothing about
+	// is a chart the repository does not have.
+	if len(versions) == 0 {
+		return nil, fmt.Errorf("%w: %s in %s", ErrChartNotFound, chartName, repoURL)
+	}
+
+	return versions, nil
 }

@@ -8,29 +8,68 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// stubVersionSource stands in for the ArgoCD client, keyed by repository URL and chart name.
+// stubVersionSource stands in for the ArgoCD client. Helm versions and OCI tags are keyed by
+// repository URL and chart name, Git tags by repository URL alone, the way ArgoCD reports
+// them.
 type stubVersionSource struct {
-	versions map[string][]string
-	err      error
+	helmVersions map[string][]string
+	ociTags      map[string][]string
+	gitTags      map[string][]string
+	err          error
 
 	// Recorded arguments of the last call, so tests can check what was asked of ArgoCD.
 	lastRepoURL   string
 	lastChartName string
 	lastProject   string
-	calls         int
+
+	// Calls per kind of repository, so tests can check where a repository was routed.
+	helmCalls int
+	ociCalls  int
+	gitCalls  int
 }
 
 func (s *stubVersionSource) GetHelmChartVersions(_ context.Context, repoURL, chartName, project string) ([]string, error) {
-	s.calls++
-	s.lastRepoURL = repoURL
-	s.lastChartName = chartName
-	s.lastProject = project
+	s.helmCalls++
+	s.record(repoURL, chartName, project)
 
 	if s.err != nil {
 		return nil, s.err
 	}
 
-	return s.versions[repoURL+"|"+chartName], nil
+	return s.helmVersions[repoURL+"|"+chartName], nil
+}
+
+func (s *stubVersionSource) GetOCITags(_ context.Context, repoURL, chartName, project string) ([]string, error) {
+	s.ociCalls++
+	s.record(repoURL, chartName, project)
+
+	if s.err != nil {
+		return nil, s.err
+	}
+
+	return s.ociTags[repoURL+"|"+chartName], nil
+}
+
+func (s *stubVersionSource) GetGitTags(_ context.Context, repoURL, project string) ([]string, error) {
+	s.gitCalls++
+	s.record(repoURL, "", project)
+
+	if s.err != nil {
+		return nil, s.err
+	}
+
+	return s.gitTags[repoURL], nil
+}
+
+func (s *stubVersionSource) record(repoURL, chartName, project string) {
+	s.lastRepoURL = repoURL
+	s.lastChartName = chartName
+	s.lastProject = project
+}
+
+// calls is how often ArgoCD was asked anything at all.
+func (s *stubVersionSource) calls() int {
+	return s.helmCalls + s.ociCalls + s.gitCalls
 }
 
 func newTestChecker(t *testing.T, source ChartVersionSource) *Checker {
@@ -73,7 +112,7 @@ func TestNewChecker_WithoutVersionSource(t *testing.T) {
 // application. The project is what lets ArgoCD resolve project-scoped credentials.
 func TestCheckerGetLatestVersion_FromArgoCD(t *testing.T) {
 	source := &stubVersionSource{
-		versions: map[string][]string{
+		helmVersions: map[string][]string{
 			"https://charts.example.com|nginx": {"1.19.5", "1.21.0", "1.20.0"},
 		},
 	}
@@ -101,7 +140,7 @@ func TestCheckerGetLatestVersion_FromArgoCD(t *testing.T) {
 // treated as missing from the repository.
 func TestCheckerGetLatestVersion_ChartNotFound(t *testing.T) {
 	source := &stubVersionSource{
-		versions: map[string][]string{
+		helmVersions: map[string][]string{
 			"https://charts.example.com|redis": {"7.0.0"},
 		},
 	}
@@ -141,7 +180,7 @@ func TestCheckerGetLatestVersion_SourceError(t *testing.T) {
 // not semver are ignored.
 func TestCheckerGetLatestVersion_InvalidVersions(t *testing.T) {
 	source := &stubVersionSource{
-		versions: map[string][]string{
+		helmVersions: map[string][]string{
 			"https://charts.example.com|nginx": {"latest", "dev", "1.2.3", "invalid-version"},
 		},
 	}
@@ -161,7 +200,7 @@ func TestCheckerGetLatestVersion_InvalidVersions(t *testing.T) {
 // to the versions ArgoCD reports.
 func TestCheckerGetLatestVersionWithConstraint_FromArgoCD(t *testing.T) {
 	source := &stubVersionSource{
-		versions: map[string][]string{
+		helmVersions: map[string][]string{
 			"https://charts.example.com|nginx": {"1.2.0", "1.5.0", "2.0.0"},
 		},
 	}
@@ -204,7 +243,7 @@ func TestCheckerGetLatestVersionWithConstraint_ChartNotFound(t *testing.T) {
 // project still reaches ArgoCD, which then treats the repository as globally registered.
 func TestCheckerGetLatestVersion_EmptyProject(t *testing.T) {
 	source := &stubVersionSource{
-		versions: map[string][]string{
+		helmVersions: map[string][]string{
 			"https://charts.example.com|nginx": {"1.20.0", "1.21.0"},
 		},
 	}
@@ -224,17 +263,213 @@ func TestCheckerGetLatestVersion_EmptyProject(t *testing.T) {
 	}
 }
 
-// TestCheckerGetLatestVersion_ProjectNotAskedForOCI checks that OCI registries are handled
-// by the OCI checker and never reach ArgoCD, so no project is needed for them.
-func TestCheckerGetLatestVersion_ProjectNotAskedForOCI(t *testing.T) {
-	source := &stubVersionSource{}
+// TestCheckerGetLatestVersion_FromOCIThroughArgoCD checks that an OCI registry is asked for
+// through ArgoCD too, with the project of the application: a private registry is reachable
+// with the credentials ArgoCD stores for it, and with those alone.
+func TestCheckerGetLatestVersion_FromOCIThroughArgoCD(t *testing.T) {
+	source := &stubVersionSource{
+		ociTags: map[string][]string{
+			"ghcr.io/myorg/charts|nginx": {"1.20.0", "latest", "1.21.0"},
+		},
+	}
 	checker := newTestChecker(t, source)
 
-	// The registry does not exist, only the routing decision matters here.
-	_, _ = checker.GetLatestVersion(context.Background(), "registry.example.com/charts", "nginx", "team-a")
+	version, err := checker.GetLatestVersion(context.Background(), "ghcr.io/myorg/charts", "nginx", "team-a")
+	if err != nil {
+		t.Fatalf("GetLatestVersion failed: %v", err)
+	}
 
-	if source.calls != 0 {
-		t.Errorf("Expected ArgoCD not to be asked for an OCI repository, got %d calls", source.calls)
+	// A tag that is no version at all is skipped rather than being taken for the newest one.
+	if version != "1.21.0" {
+		t.Errorf("Expected version 1.21.0, got %s", version)
+	}
+
+	if source.ociCalls != 1 || source.calls() != 1 {
+		t.Errorf("Expected exactly one OCI request to ArgoCD, got %d of %d calls", source.ociCalls, source.calls())
+	}
+
+	if source.lastProject != "team-a" {
+		t.Errorf("Expected ArgoCD to be asked within project team-a, got %q", source.lastProject)
+	}
+}
+
+// TestCheckerGetLatestVersion_OCISchemeIsRouted checks that the oci:// scheme an Application
+// may carry is recognised as an OCI registry rather than a Helm repository.
+func TestCheckerGetLatestVersion_OCISchemeIsRouted(t *testing.T) {
+	source := &stubVersionSource{
+		ociTags: map[string][]string{
+			"oci://ghcr.io/myorg/charts|nginx": {"1.21.0"},
+		},
+	}
+	checker := newTestChecker(t, source)
+
+	version, err := checker.GetLatestVersion(context.Background(), "oci://ghcr.io/myorg/charts", "nginx", "team-a")
+	if err != nil {
+		t.Fatalf("GetLatestVersion failed: %v", err)
+	}
+
+	if version != "1.21.0" {
+		t.Errorf("Expected version 1.21.0, got %s", version)
+	}
+
+	if source.ociCalls != 1 {
+		t.Errorf("Expected the OCI request to ArgoCD, got %d OCI calls of %d", source.ociCalls, source.calls())
+	}
+}
+
+// TestCheckerGetLatestVersionWithConstraint_FromOCI checks that OCI tags go through the same
+// constraint logic as the versions of a Helm repository.
+func TestCheckerGetLatestVersionWithConstraint_FromOCI(t *testing.T) {
+	source := &stubVersionSource{
+		ociTags: map[string][]string{
+			"ghcr.io/myorg/charts|nginx": {"1.2.0", "1.5.0", "2.0.0"},
+		},
+	}
+	checker := newTestChecker(t, source)
+
+	result, err := checker.GetLatestVersionWithConstraint(context.Background(), "ghcr.io/myorg/charts", "nginx", "team-a", "1.2.0", "minor")
+	if err != nil {
+		t.Fatalf("GetLatestVersionWithConstraint failed: %v", err)
+	}
+
+	if result.LatestVersion != "1.5.0" {
+		t.Errorf("LatestVersion = %s, expected 1.5.0", result.LatestVersion)
+	}
+
+	if result.LatestVersionAll != "2.0.0" {
+		t.Errorf("LatestVersionAll = %s, expected 2.0.0", result.LatestVersionAll)
+	}
+}
+
+// TestCheckerGetLatestVersion_OCIWithoutTags checks that an artifact ArgoCD reports no tags
+// for is treated as a missing chart.
+func TestCheckerGetLatestVersion_OCIWithoutTags(t *testing.T) {
+	checker := newTestChecker(t, &stubVersionSource{})
+
+	_, err := checker.GetLatestVersion(context.Background(), "ghcr.io/myorg/charts", "nginx", "team-a")
+	if !errors.Is(err, ErrChartNotFound) {
+		t.Errorf("Expected ErrChartNotFound, got: %v", err)
+	}
+}
+
+// TestCheckerGetLatestVersion_OCIError checks that a failing OCI request is reported as a
+// failure and not as an empty registry.
+func TestCheckerGetLatestVersion_OCIError(t *testing.T) {
+	sourceErr := errors.New("registry unavailable")
+	checker := newTestChecker(t, &stubVersionSource{err: sourceErr})
+
+	_, err := checker.GetLatestVersion(context.Background(), "ghcr.io/myorg/charts", "nginx", "team-a")
+	if !errors.Is(err, sourceErr) {
+		t.Errorf("Expected the ArgoCD error to be wrapped, got: %v", err)
+	}
+
+	if errors.Is(err, ErrChartNotFound) {
+		t.Error("An ArgoCD failure must not be reported as a missing chart")
+	}
+}
+
+// TestCheckerGetLatestVersion_FromGitThroughArgoCD checks that a Git repository is asked for
+// through ArgoCD as well, and that the chart is not part of that question: ArgoCD lists the
+// tags of the whole repository.
+func TestCheckerGetLatestVersion_FromGitThroughArgoCD(t *testing.T) {
+	source := &stubVersionSource{
+		gitTags: map[string][]string{
+			"https://github.com/myorg/charts.git": {"v1.2.3", "not-a-version", "v1.3.0"},
+		},
+	}
+	checker := newTestChecker(t, source)
+
+	version, err := checker.GetLatestVersion(context.Background(), "https://github.com/myorg/charts.git", "charts/nginx", "team-a")
+	if err != nil {
+		t.Fatalf("GetLatestVersion failed: %v", err)
+	}
+
+	if version != "v1.3.0" {
+		t.Errorf("Expected version v1.3.0, got %s", version)
+	}
+
+	if source.gitCalls != 1 || source.calls() != 1 {
+		t.Errorf("Expected exactly one Git request to ArgoCD, got %d of %d calls", source.gitCalls, source.calls())
+	}
+
+	if source.lastProject != "team-a" {
+		t.Errorf("Expected ArgoCD to be asked within project team-a, got %q", source.lastProject)
+	}
+}
+
+// TestCheckerGetLatestVersion_GitTagsOfTheChart checks that a repository holding several
+// charts is read per chart: a tag naming another chart is not a version of this one.
+func TestCheckerGetLatestVersion_GitTagsOfTheChart(t *testing.T) {
+	source := &stubVersionSource{
+		gitTags: map[string][]string{
+			"https://github.com/myorg/charts.git": {"nginx-1.2.3", "redis-9.9.9"},
+		},
+	}
+	checker := newTestChecker(t, source)
+
+	version, err := checker.GetLatestVersion(context.Background(), "https://github.com/myorg/charts.git", "charts/nginx", "team-a")
+	if err != nil {
+		t.Fatalf("GetLatestVersion failed: %v", err)
+	}
+
+	if version != "1.2.3" {
+		t.Errorf("Expected version 1.2.3, got %s", version)
+	}
+}
+
+// TestCheckerGetLatestVersion_GitWithoutVersionTags checks that a repository whose tags hold
+// no version of the chart is treated as not holding the chart.
+func TestCheckerGetLatestVersion_GitWithoutVersionTags(t *testing.T) {
+	source := &stubVersionSource{
+		gitTags: map[string][]string{
+			"https://github.com/myorg/charts.git": {"redis-9.9.9", "some-tag"},
+		},
+	}
+	checker := newTestChecker(t, source)
+
+	_, err := checker.GetLatestVersion(context.Background(), "https://github.com/myorg/charts.git", "charts/nginx", "team-a")
+	if !errors.Is(err, ErrChartNotFound) {
+		t.Errorf("Expected ErrChartNotFound, got: %v", err)
+	}
+}
+
+// TestCheckerGetLatestVersionWithConstraint_FromGit checks that Git tags go through the same
+// constraint logic as the versions of a Helm repository.
+func TestCheckerGetLatestVersionWithConstraint_FromGit(t *testing.T) {
+	source := &stubVersionSource{
+		gitTags: map[string][]string{
+			"https://github.com/myorg/charts.git": {"v1.2.0", "v1.5.0", "v2.0.0"},
+		},
+	}
+	checker := newTestChecker(t, source)
+
+	result, err := checker.GetLatestVersionWithConstraint(context.Background(), "https://github.com/myorg/charts.git", "charts/nginx", "team-a", "v1.2.0", "minor")
+	if err != nil {
+		t.Fatalf("GetLatestVersionWithConstraint failed: %v", err)
+	}
+
+	if result.LatestVersion != "v1.5.0" {
+		t.Errorf("LatestVersion = %s, expected v1.5.0", result.LatestVersion)
+	}
+
+	if result.LatestVersionAll != "v2.0.0" {
+		t.Errorf("LatestVersionAll = %s, expected v2.0.0", result.LatestVersionAll)
+	}
+}
+
+// TestCheckerGetLatestVersion_GitError checks that a failing Git request is reported as a
+// failure.
+func TestCheckerGetLatestVersion_GitError(t *testing.T) {
+	sourceErr := errors.New("repository not accessible")
+	checker := newTestChecker(t, &stubVersionSource{err: sourceErr})
+
+	_, err := checker.GetLatestVersion(context.Background(), "https://github.com/myorg/charts.git", "charts/nginx", "team-a")
+	if !errors.Is(err, sourceErr) {
+		t.Errorf("Expected the ArgoCD error to be wrapped, got: %v", err)
+	}
+
+	if errors.Is(err, ErrChartNotFound) {
+		t.Error("An ArgoCD failure must not be reported as a missing chart")
 	}
 }
 

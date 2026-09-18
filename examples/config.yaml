@@ -6,6 +6,7 @@
 # ============================================================================
 # Use environment variables for credentials in production:
 #   export AG_ARGOCD_URL="argocd.example.com"
+#   export ARGOCD_AUTH_TOKEN="eyJhbGciOi..."
 #   export AG_ARGOCD_USERNAME="admin"
 #   export AG_ARGOCD_PASSWORD="secret"
 #
@@ -15,9 +16,17 @@
 
 # ArgoCD Connection Settings
 argocd_url: "https://argocd.example.com"
+argocd_insecure: false  # Set to true to skip TLS verification
+
+# Authentication: either an API token or a username and password.
+# The token wins when both are given, and needs no login round-trip, which makes it the
+# better fit for CI/CD and CronJobs. Create one with:
+#   argocd account generate-token --account argazer
+# It can also come from the environment as ARGOCD_AUTH_TOKEN (the variable the ArgoCD CLI
+# uses) or AG_ARGOCD_AUTH_TOKEN, or from the --argocd-auth-token flag.
+argocd_auth_token: ""  # USE ENVIRONMENT VARIABLE INSTEAD!
 argocd_username: "admin"
 argocd_password: "password"  # USE ENVIRONMENT VARIABLE INSTEAD!
-argocd_insecure: false  # Set to true to skip TLS verification
 
 # Search Scope
 # Use ["*"] to match all, or specify a list of specific values
@@ -96,6 +105,7 @@ fail_on: "none"
 # - "text": Human-readable text logs for development/debugging
 log_format: "json"
 
-# Private Helm repositories need no credentials here: their chart versions are read
-# through the ArgoCD API, which reaches the repository with the credentials ArgoCD
-# already stores for it.
+# Private repositories need no credentials here, whatever their kind: chart versions of
+# Helm repositories, tags of OCI artifacts and tags of Git repositories are all read
+# through the ArgoCD API, which reaches the repository with the credentials ArgoCD already
+# stores for it. Listing the tags of an OCI artifact requires ArgoCD 3.1 or newer.

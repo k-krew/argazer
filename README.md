@@ -11,7 +11,7 @@
 ## Features
 
 - **Single-run execution** - Runs once on launch, perfect for CI/CD or cron jobs.
-- **Multiple repository types** - Native support for Traditional HTTP Helm repos, OCI Registries, and Git Repositories.
+- **Multiple repository types** - Traditional HTTP Helm repos, OCI Registries, and Git Repositories, all read through the ArgoCD API, so private ones need no credentials in Argazer.
 - **Interactive configuration** - Run `argazer configure` for a step-by-step setup wizard.
 - **Flexible output formats** - Table (human-readable), JSON (programmatic), or Markdown (documentation).
 - **Controllable verbosity** - Adjust output noise using the `--verbosity` flag (`normal`, `full`, or `off`).
@@ -19,7 +19,7 @@
 - **Semantic version constraints** - Only notify on `patch`, `minor`, or `major` updates.
 - **CI/CD quality gate** - Granular exit codes plus `--fail-on` to fail a pipeline on the updates you care about.
 - **Multiple notification channels** - Telegram, Email, Slack, Microsoft Teams, or Generic Webhooks.
-- **Graceful error handling & retries** - Reliable notifications with exponential backoff on network failures.
+- **Graceful error handling & retries** - Requests to ArgoCD and outgoing notifications are retried with backoff, so a momentary hiccup does not skip a repository or lose a report.
 
 ## Installation
 
@@ -75,6 +75,22 @@ AG_ARGOCD_URL="argocd.example.com" AG_ARGOCD_USERNAME="admin" AG_ARGOCD_PASSWORD
 # Run with flags
 ./argazer --argocd-url="argocd.example.com" --argocd-username="admin" --argocd-password="password"
 ```
+
+### Authentication
+
+Argazer authenticates against ArgoCD either with an API token or with a username and password. A token is the better choice for CI/CD and CronJobs: it can belong to a local account with read-only permissions and needs no login round-trip.
+
+```bash
+# Token as a flag
+./argazer --argocd-url="argocd.example.com" --argocd-auth-token="eyJhbGciOi..."
+
+# Token from the environment. ARGOCD_AUTH_TOKEN is the variable the ArgoCD CLI itself uses,
+# so an existing one is picked up as is; AG_ARGOCD_AUTH_TOKEN works as well.
+export ARGOCD_AUTH_TOKEN="eyJhbGciOi..."
+./argazer --argocd-url="argocd.example.com"
+```
+
+Generate a token for a local ArgoCD account with `argocd account generate-token --account argazer`. When a token is set, the username and password are ignored.
 
 ### Output and Verbosity Control
 
@@ -146,6 +162,7 @@ Argazer can be configured via a `config.yaml` file, CLI flags, or environment va
 ### `config.yaml` Example
 ```yaml
 argocd_url: "argocd.example.com"
+argocd_auth_token: ""  # API token; when set, username and password are ignored
 argocd_username: "admin"
 argocd_password: "your-password"
 argocd_insecure: false
@@ -168,8 +185,13 @@ fail_on: "none"
 ### Environment Variables
 ```bash
 export AG_ARGOCD_URL="argocd.example.com"
+
+# Either a token...
+export ARGOCD_AUTH_TOKEN="eyJhbGciOi..."  # or AG_ARGOCD_AUTH_TOKEN
+# ...or a username and password
 export AG_ARGOCD_USERNAME="admin"
 export AG_ARGOCD_PASSWORD="your-password"
+
 export AG_PROJECTS="production,staging"
 export AG_LABELS="type=operator,environment=production"
 export AG_OUTPUT_FORMAT="table"
@@ -179,15 +201,17 @@ export AG_VERBOSITY="normal"
 
 ## Private Repositories
 
-Argazer never needs the credentials of your Helm repositories. Versions of traditional Helm repositories are read through the ArgoCD API, so ArgoCD reaches the repository with the credentials it already stores and hands Argazer the resulting list of chart versions. Any private Helm repository already registered in ArgoCD works without extra configuration.
+Argazer never needs the credentials of your chart repositories. Every version list is read through the ArgoCD API, so ArgoCD reaches the repository with the credentials it already stores and hands Argazer the result. Any private repository already registered in ArgoCD works without extra configuration — including project-scoped ones, since Argazer asks within the project of the application.
 
 ## Supported Repository Types
 
-Argazer automatically detects the repository type based on the URL in ArgoCD:
+Argazer automatically detects the repository type based on the URL in ArgoCD, and asks the ArgoCD API for the versions of each:
 
-1. **Git Repositories**: Detects `.git` URLs (e.g., `https://github.com/myorg/helm-charts.git`). Reads versions directly from git tags. Only public repositories are supported.
-2. **OCI Registries**: Detects registries without `http://` or `https://` (e.g., `ghcr.io/myorg/charts`). Read anonymously from the registry, so the registry has to allow anonymous tag listing.
-3. **Traditional Helm**: Classic HTTP-based repositories, read through the ArgoCD API. Private repositories are supported.
+1. **Traditional Helm**: Classic HTTP-based repositories (e.g. `https://charts.example.com`). Versions come from the chart list of the repository.
+2. **OCI Registries**: Registries without `http://` or `https://`, with or without the `oci://` scheme (e.g. `ghcr.io/myorg/charts`). Versions are the tags of the artifact holding the chart. This needs **ArgoCD 3.1 or newer**, which is the first version whose API can list OCI tags.
+3. **Git Repositories**: `.git` URLs and the usual hosting platforms (e.g. `https://github.com/myorg/helm-charts.git`). Versions come from the tags of the repository: a tag prefixed with the chart name (`nginx-1.2.3`) counts as a version of that chart, and repositories holding a single chart can tag it plainly (`v1.2.3`, `release-1.2.3`).
+
+A repository that is not registered in ArgoCD cannot be checked, and neither can a repository the Argazer user is not allowed to read.
 
 ## ArgoCD RBAC Setup
 
@@ -204,7 +228,9 @@ g, argazer, role:argazer-reader
 ## Troubleshooting
 
 - **No Applications Found**: Verify your `projects`, `app_names`, and `labels` filters. Ensure the ArgoCD user has RBAC permissions to list applications.
-- **Chart Not Found**: Chart versions of Helm repositories come from ArgoCD, so the repository has to be registered in ArgoCD and the Argazer user needs `repositories, get` permission on it.
+- **Chart Not Found**: Chart versions come from ArgoCD, so the repository has to be registered in ArgoCD and the Argazer user needs `repositories, get` permission on it.
+- **OCI tags require ArgoCD 3.1**: Listing the tags of an OCI artifact uses an API endpoint added in ArgoCD 3.1. On older servers the request answers with a 404, and the applications using OCI registries are reported as skipped.
+- **Private OCI registry answers with a 401**: ArgoCD finds the credentials of a repository by its URL, matched as a whole. A registry registered as `oci://ghcr.io/myorg/nginx` therefore covers applications whose `repoURL` is spelled the same way, and applications naming a chart separately (`repoURL: ghcr.io/myorg/charts` with `chart: nginx`) are read as `ghcr.io/myorg/charts/nginx`, which a [repository credential template](https://argo-cd.readthedocs.io/en/stable/operator-manual/declarative-setup/#repository-credentials) covering the registry is the way to authenticate.
 - **Connection Issues**: Ensure `argocd_url` does not contain the `https://` prefix (e.g., use `argocd.example.com`). Try setting `argocd_insecure: true` if using self-signed certificates.
 - **Seeing too much output?**: Use `--verbosity="off"` to hide operational logs and only display the final scan results.
 
