@@ -80,6 +80,16 @@ version_constraint: "major"
 # - "markdown": Markdown formatted output for documentation
 output_format: "table"
 
+# Fail On
+# Controls the exit code when updates requiring a manifest change are found
+# Exit codes: 0 - nothing to report, 1 - the scan could not be completed, 2 - updates found
+# - "none": Never exit with 2, just report the updates (default, use for CronJobs)
+# - "any": Exit with 2 on any update, including the ones whose severity is unknown
+# - "patch": Exit with 2 on patch updates and above
+# - "minor": Exit with 2 on minor and major updates
+# - "major": Exit with 2 on major updates only
+fail_on: "none"
+
 # Log Format
 # Controls the format of application logs (not the scan results)
 # - "json": Structured JSON logs for production/parsing (default)

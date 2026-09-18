@@ -312,4 +312,72 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, []string{"*"}, cfg.Projects)
 	assert.Equal(t, []string{"*"}, cfg.AppNames)
 	assert.Equal(t, map[string]string{}, cfg.Labels)
+	assert.Equal(t, FailOnNone, cfg.FailOn)
+}
+
+func TestLoad_FailOnValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		failOn      string
+		expectedErr string
+	}{
+		{name: "none", failOn: FailOnNone},
+		{name: "any", failOn: FailOnAny},
+		{name: "patch", failOn: FailOnPatch},
+		{name: "minor", failOn: FailOnMinor},
+		{name: "major", failOn: FailOnMajor},
+		{name: "invalid value", failOn: "everything", expectedErr: "fail_on must be one of"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer viper.Reset()
+
+			viper.Reset()
+			os.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
+			os.Setenv("AG_ARGOCD_USERNAME", "admin")
+			os.Setenv("AG_ARGOCD_PASSWORD", "password")
+			os.Setenv("AG_FAIL_ON", tt.failOn)
+
+			defer func() {
+				os.Unsetenv("AG_ARGOCD_URL")
+				os.Unsetenv("AG_ARGOCD_USERNAME")
+				os.Unsetenv("AG_ARGOCD_PASSWORD")
+				os.Unsetenv("AG_FAIL_ON")
+			}()
+
+			cfg, err := Load()
+			if tt.expectedErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.expectedErr)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.failOn, cfg.FailOn)
+		})
+	}
+}
+
+// TestLoad_FailOnEmpty makes sure an explicitly empty value behaves like "none", so a run
+// without a quality gate never exits with code 2.
+func TestLoad_FailOnEmpty(t *testing.T) {
+	defer viper.Reset()
+
+	viper.Reset()
+	os.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
+	os.Setenv("AG_ARGOCD_USERNAME", "admin")
+	os.Setenv("AG_ARGOCD_PASSWORD", "password")
+	os.Setenv("AG_FAIL_ON", "")
+
+	defer func() {
+		os.Unsetenv("AG_ARGOCD_URL")
+		os.Unsetenv("AG_ARGOCD_USERNAME")
+		os.Unsetenv("AG_ARGOCD_PASSWORD")
+		os.Unsetenv("AG_FAIL_ON")
+	}()
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, FailOnNone, cfg.FailOn)
 }
