@@ -8,8 +8,6 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"argazer/internal/auth"
-
 	"github.com/sirupsen/logrus"
 )
 
@@ -28,8 +26,7 @@ func TestOCICheckerGetLatestVersion_Success(t *testing.T) {
 	defer server.Close()
 
 	logger := logrus.NewEntry(logrus.New())
-	authProvider, _ := auth.NewProvider(nil, logger)
-	checker := NewOCIChecker(authProvider, logger)
+	checker := NewOCIChecker(logger)
 
 	ctx := context.Background()
 	// Extract just the host from server.URL (remove http://)
@@ -54,8 +51,7 @@ func TestOCICheckerGetLatestVersion_Unauthorized(t *testing.T) {
 	defer server.Close()
 
 	logger := logrus.NewEntry(logrus.New())
-	authProvider, _ := auth.NewProvider(nil, logger)
-	checker := NewOCIChecker(authProvider, logger)
+	checker := NewOCIChecker(logger)
 
 	ctx := context.Background()
 	repoURL := server.URL[7:]
@@ -78,8 +74,7 @@ func TestOCICheckerGetLatestVersion_NotFound(t *testing.T) {
 	defer server.Close()
 
 	logger := logrus.NewEntry(logrus.New())
-	authProvider, _ := auth.NewProvider(nil, logger)
-	checker := NewOCIChecker(authProvider, logger)
+	checker := NewOCIChecker(logger)
 
 	ctx := context.Background()
 	repoURL := server.URL[7:]
@@ -102,8 +97,7 @@ func TestOCICheckerGetLatestVersion_InvalidJSON(t *testing.T) {
 	defer server.Close()
 
 	logger := logrus.NewEntry(logrus.New())
-	authProvider, _ := auth.NewProvider(nil, logger)
-	checker := NewOCIChecker(authProvider, logger)
+	checker := NewOCIChecker(logger)
 
 	ctx := context.Background()
 	repoURL := server.URL[7:]
@@ -127,8 +121,7 @@ func TestOCICheckerGetLatestVersion_NoValidVersions(t *testing.T) {
 	defer server.Close()
 
 	logger := logrus.NewEntry(logrus.New())
-	authProvider, _ := auth.NewProvider(nil, logger)
-	checker := NewOCIChecker(authProvider, logger)
+	checker := NewOCIChecker(logger)
 
 	ctx := context.Background()
 	repoURL := server.URL[7:]
@@ -155,8 +148,7 @@ func TestOCICheckerGetLatestVersion_WithVPrefix(t *testing.T) {
 	defer server.Close()
 
 	logger := logrus.NewEntry(logrus.New())
-	authProvider, _ := auth.NewProvider(nil, logger)
-	checker := NewOCIChecker(authProvider, logger)
+	checker := NewOCIChecker(logger)
 
 	ctx := context.Background()
 	repoURL := server.URL[7:]
@@ -184,8 +176,7 @@ func TestOCICheckerGetLatestVersion_MixedValidInvalid(t *testing.T) {
 	defer server.Close()
 
 	logger := logrus.NewEntry(logrus.New())
-	authProvider, _ := auth.NewProvider(nil, logger)
-	checker := NewOCIChecker(authProvider, logger)
+	checker := NewOCIChecker(logger)
 
 	ctx := context.Background()
 	repoURL := server.URL[7:]
@@ -198,48 +189,6 @@ func TestOCICheckerGetLatestVersion_MixedValidInvalid(t *testing.T) {
 	expected := "3.0.0-beta"
 	if version != expected {
 		t.Errorf("Expected version %s, got %s", expected, version)
-	}
-}
-
-// TestOCICheckerGetLatestVersion_WithAuthentication tests that auth is applied
-func TestOCICheckerGetLatestVersion_WithAuthentication(t *testing.T) {
-	receivedAuth := false
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		if auth != "" {
-			receivedAuth = true
-		}
-
-		tagsJSON := `{
-  "name": "myrepo/app",
-  "tags": ["1.0.0"]
-}`
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, tagsJSON)
-	}))
-	defer server.Close()
-
-	logger := logrus.NewEntry(logrus.New())
-	// Extract host from server URL
-	serverHost := server.URL[7:] // Remove "http://"
-	configAuth := []auth.ConfigAuth{
-		{
-			URL:      serverHost,
-			Username: "testuser",
-			Password: "testpass",
-		},
-	}
-	authProvider, _ := auth.NewProvider(configAuth, logger)
-	checker := NewOCIChecker(authProvider, logger)
-
-	ctx := context.Background()
-	_, err := checker.GetLatestVersion(ctx, serverHost, "app")
-	if err != nil {
-		t.Fatalf("GetLatestVersion failed: %v", err)
-	}
-
-	if !receivedAuth {
-		t.Error("Expected Authorization header to be sent, but it wasn't")
 	}
 }
 

@@ -90,16 +90,6 @@ type Config struct {
 	VersionConstraint string `mapstructure:"version_constraint"` // Version constraint: "major", "minor", "patch" (default: "major")
 	OutputFormat      string `mapstructure:"output_format"`      // Output format: "table", "json", "markdown" (default: "table")
 	FailOn            string `mapstructure:"fail_on"`            // Exit with code 2 on updates of this severity or higher: "none", "any", "patch", "minor", "major" (default: "none")
-
-	// Repository authentication
-	RepositoryAuth []RepositoryAuth `mapstructure:"repository_auth"`
-}
-
-// RepositoryAuth holds authentication for a specific repository or registry
-type RepositoryAuth struct {
-	URL      string `mapstructure:"url"`
-	Username string `mapstructure:"username"`
-	Password string `mapstructure:"password"`
 }
 
 // Load loads configuration from various sources
@@ -162,7 +152,6 @@ func setDefaults() {
 
 	// Map defaults
 	viper.SetDefault("labels", map[string]string{})
-	viper.SetDefault("repository_auth", []RepositoryAuth{})
 }
 
 // loadConfigFile loads configuration from file (if specified or found in default paths)

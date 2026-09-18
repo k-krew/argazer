@@ -96,16 +96,6 @@ fail_on: "none"
 # - "text": Human-readable text logs for development/debugging
 log_format: "json"
 
-# Repository Authentication (optional)
-# WARNING: DO NOT store credentials here in production!
-# Use environment variables instead:
-#   export AG_AUTH_URL_1="harbor.company.com"
-#   export AG_AUTH_USER_1="myuser"
-#   export AG_AUTH_PASS_1="mypassword"
-repository_auth:
-  # - url: "harbor.company.com"
-  #   username: "myuser"
-  #   password: "mypassword"  # USE ENVIRONMENT VARIABLE INSTEAD!
-  # - url: "ghcr.io"
-  #   username: "github-user"
-  #   password: "ghp_token"  # USE ENVIRONMENT VARIABLE INSTEAD!
+# Private Helm repositories need no credentials here: their chart versions are read
+# through the ArgoCD API, which reaches the repository with the credentials ArgoCD
+# already stores for it.

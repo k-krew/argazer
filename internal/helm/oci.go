@@ -9,26 +9,22 @@ import (
 	"strings"
 	"time"
 
-	"argazer/internal/auth"
-
 	"github.com/sirupsen/logrus"
 )
 
 // OCIChecker checks OCI-based Helm repositories for new chart versions
 type OCIChecker struct {
-	httpClient   *http.Client
-	authProvider *auth.Provider
-	logger       *logrus.Entry
+	httpClient *http.Client
+	logger     *logrus.Entry
 }
 
 // NewOCIChecker creates a new OCI checker
-func NewOCIChecker(authProvider *auth.Provider, logger *logrus.Entry) *OCIChecker {
+func NewOCIChecker(logger *logrus.Entry) *OCIChecker {
 	return &OCIChecker{
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		authProvider: authProvider,
-		logger:       logger,
+		logger: logger,
 	}
 }
 
@@ -84,19 +80,6 @@ func (o *OCIChecker) getTagsFromOCI(ctx context.Context, repoURL, chartName stri
 	req.Header.Set("User-Agent", "argazer/1.0")
 	req.Header.Set("Accept", "application/json")
 
-	// Add authentication if available
-	creds := o.authProvider.GetCredentials(registry)
-	if creds != nil {
-		req.SetBasicAuth(creds.Username, creds.Password)
-		o.logger.WithFields(logrus.Fields{
-			"source":   creds.Source,
-			"username": creds.Username,
-			"registry": registry,
-		}).Debug("Using authentication for OCI registry")
-	} else {
-		o.logger.WithField("registry", registry).Debug("No credentials found, trying anonymous access")
-	}
-
 	// Make request
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -110,10 +93,7 @@ func (o *OCIChecker) getTagsFromOCI(ctx context.Context, repoURL, chartName stri
 
 	// Check response status
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		if creds != nil {
-			return nil, fmt.Errorf("%w for %s (status %d): check credentials", ErrAuthenticationFailed, registry, resp.StatusCode)
-		}
-		return nil, fmt.Errorf("%w for %s (status %d): set AG_AUTH_* environment variables or add to repository_auth in config file", ErrAuthenticationFailed, registry, resp.StatusCode)
+		return nil, fmt.Errorf("%w for %s (status %d): the registry does not allow anonymous reads", ErrAuthenticationFailed, registry, resp.StatusCode)
 	}
 
 	if resp.StatusCode == http.StatusNotFound {

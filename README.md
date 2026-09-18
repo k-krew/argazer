@@ -177,32 +177,17 @@ export AG_VERBOSITY="normal"
 ```
 </details>
 
-## Authentication for Private Repositories
+## Private Repositories
 
-> **⚠️ SECURITY WARNING**  
-> **Do NOT store credentials in plain text config files! ALWAYS use environment variables for credentials in production.**
-
-Argazer supports authentication for Git, OCI, and HTTP Helm repositories. Provide credentials using environment variables:
-
-```bash
-# Example: GitHub Container Registry (OCI)
-export AG_AUTH_URL_GHCR="ghcr.io"
-export AG_AUTH_USER_GHCR="github-user"
-export AG_AUTH_PASS_GHCR="ghp_token"
-
-# Example: Private Git Repository
-export AG_AUTH_URL_GIT="github.com"
-export AG_AUTH_USER_GIT="git-user"
-export AG_AUTH_PASS_GIT="git-token"
-```
+Argazer never needs the credentials of your Helm repositories. Versions of traditional Helm repositories are read through the ArgoCD API, so ArgoCD reaches the repository with the credentials it already stores and hands Argazer the resulting list of chart versions. Any private Helm repository already registered in ArgoCD works without extra configuration.
 
 ## Supported Repository Types
 
 Argazer automatically detects the repository type based on the URL in ArgoCD:
 
-1. **Git Repositories**: Detects `.git` URLs (e.g., `https://github.com/myorg/helm-charts.git`). Reads versions directly from git tags.
-2. **OCI Registries**: Detects registries without `http://` or `https://` (e.g., `ghcr.io/myorg/charts`).
-3. **Traditional Helm**: Classic HTTP-based repositories with an `index.yaml`.
+1. **Git Repositories**: Detects `.git` URLs (e.g., `https://github.com/myorg/helm-charts.git`). Reads versions directly from git tags. Only public repositories are supported.
+2. **OCI Registries**: Detects registries without `http://` or `https://` (e.g., `ghcr.io/myorg/charts`). Read anonymously from the registry, so the registry has to allow anonymous tag listing.
+3. **Traditional Helm**: Classic HTTP-based repositories, read through the ArgoCD API. Private repositories are supported.
 
 ## ArgoCD RBAC Setup
 
@@ -212,12 +197,14 @@ Argazer requires minimal read-only permissions in ArgoCD. Create a dedicated use
 # argocd-rbac-cm ConfigMap
 p, role:argazer-reader, applications, get, */*, allow
 p, role:argazer-reader, applications, list, */*, allow
+p, role:argazer-reader, repositories, get, *, allow
 g, argazer, role:argazer-reader
 ```
 
 ## Troubleshooting
 
 - **No Applications Found**: Verify your `projects`, `app_names`, and `labels` filters. Ensure the ArgoCD user has RBAC permissions to list applications.
+- **Chart Not Found**: Chart versions of Helm repositories come from ArgoCD, so the repository has to be registered in ArgoCD and the Argazer user needs `repositories, get` permission on it.
 - **Connection Issues**: Ensure `argocd_url` does not contain the `https://` prefix (e.g., use `argocd.example.com`). Try setting `argocd_insecure: true` if using self-signed certificates.
 - **Seeing too much output?**: Use `--verbosity="off"` to hide operational logs and only display the final scan results.
 
