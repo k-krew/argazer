@@ -14,11 +14,17 @@ const (
 	OutputFormatMarkdown = "markdown"
 )
 
-// Version constraint constants
+// Notify-on constants: the widest version bump a run reports on
 const (
-	VersionConstraintMajor = "major"
-	VersionConstraintMinor = "minor"
-	VersionConstraintPatch = "patch"
+	NotifyOnMajor = "major" // Report every newer version
+	NotifyOnMinor = "minor" // Report versions with the same major
+	NotifyOnPatch = "patch" // Report versions with the same major.minor
+)
+
+// Notification channel constants: the channels a report can be pushed to
+const (
+	NotificationChannelSlack   = "slack"
+	NotificationChannelWebhook = "webhook"
 )
 
 // Fail-on constants: the lowest update severity that makes the run exit with code 2
@@ -58,38 +64,22 @@ type Config struct {
 	Labels   map[string]string `mapstructure:"labels"`    // Label filters
 
 	// Notification settings
-	NotificationChannel string `mapstructure:"notification_channel"` // "telegram", "email", "slack", "teams", "webhook", or empty
-
-	// Telegram settings
-	TelegramWebhook string `mapstructure:"telegram_webhook"`
-	TelegramChatID  string `mapstructure:"telegram_chat_id"`
-
-	// Email settings
-	EmailSmtpHost     string   `mapstructure:"email_smtp_host"`
-	EmailSmtpPort     int      `mapstructure:"email_smtp_port"`
-	EmailSmtpUsername string   `mapstructure:"email_smtp_username"`
-	EmailSmtpPassword string   `mapstructure:"email_smtp_password"`
-	EmailFrom         string   `mapstructure:"email_from"`
-	EmailTo           []string `mapstructure:"email_to"`
-	EmailUseTLS       bool     `mapstructure:"email_use_tls"`
+	NotificationChannel string `mapstructure:"notification_channel"` // "slack", "webhook", or empty
 
 	// Slack settings
 	SlackWebhook string `mapstructure:"slack_webhook"`
-
-	// Microsoft Teams settings
-	TeamsWebhook string `mapstructure:"teams_webhook"`
 
 	// Generic Webhook settings
 	WebhookURL string `mapstructure:"webhook_url"`
 
 	// General settings
-	Verbosity         string `mapstructure:"verbosity"`
-	LogFormat         string `mapstructure:"log_format"`         // Log format: "json" or "text" (default: "json")
-	SourceName        string `mapstructure:"source_name"`        // Name of the source to check in multi-source applications
-	Concurrency       int    `mapstructure:"concurrency"`        // Number of concurrent workers for checking applications
-	VersionConstraint string `mapstructure:"version_constraint"` // Version constraint: "major", "minor", "patch" (default: "major")
-	OutputFormat      string `mapstructure:"output_format"`      // Output format: "table", "json", "markdown" (default: "table")
-	FailOn            string `mapstructure:"fail_on"`            // Exit with code 2 on updates of this severity or higher: "none", "any", "patch", "minor", "major" (default: "none")
+	Verbosity    string `mapstructure:"verbosity"`
+	LogFormat    string `mapstructure:"log_format"`    // Log format: "json" or "text" (default: "json")
+	SourceName   string `mapstructure:"source_name"`   // Name of the source to check in multi-source applications
+	Concurrency  int    `mapstructure:"concurrency"`   // Number of concurrent workers for checking applications
+	NotifyOn     string `mapstructure:"notify_on"`     // Widest bump to report: "major", "minor", "patch" (default: "major")
+	OutputFormat string `mapstructure:"output_format"` // Output format: "table", "json", "markdown" (default: "table")
+	FailOn       string `mapstructure:"fail_on"`       // Exit with code 2 on updates of this severity or higher: "none", "any", "patch", "minor", "major" (default: "none")
 }
 
 // Load loads configuration from various sources
@@ -120,13 +110,11 @@ func setDefaults() {
 	// Boolean and numeric defaults
 	viper.SetDefault("verbosity", VerbosityNormal)
 	viper.SetDefault("argocd_insecure", false)
-	viper.SetDefault("email_smtp_port", 587)
-	viper.SetDefault("email_use_tls", true)
 	viper.SetDefault("concurrency", 10)
 
 	// String defaults
 	viper.SetDefault("source_name", "chart-repo")
-	viper.SetDefault("version_constraint", VersionConstraintMajor)
+	viper.SetDefault("notify_on", NotifyOnMajor)
 	viper.SetDefault("output_format", OutputFormatTable)
 	viper.SetDefault("fail_on", FailOnNone)
 	viper.SetDefault("log_format", LogFormatJSON)
@@ -135,20 +123,12 @@ func setDefaults() {
 	viper.SetDefault("argocd_username", "")
 	viper.SetDefault("argocd_password", "")
 	viper.SetDefault("notification_channel", "")
-	viper.SetDefault("telegram_webhook", "")
-	viper.SetDefault("telegram_chat_id", "")
-	viper.SetDefault("email_smtp_host", "")
-	viper.SetDefault("email_smtp_username", "")
-	viper.SetDefault("email_smtp_password", "")
-	viper.SetDefault("email_from", "")
 	viper.SetDefault("slack_webhook", "")
-	viper.SetDefault("teams_webhook", "")
 	viper.SetDefault("webhook_url", "")
 
 	// Array/slice defaults
 	viper.SetDefault("projects", []string{"*"})
 	viper.SetDefault("app_names", []string{"*"})
-	viper.SetDefault("email_to", []string{})
 
 	// Map defaults
 	viper.SetDefault("labels", map[string]string{})
@@ -224,7 +204,7 @@ func registerFlagAliases() {
 	viper.RegisterAlias("argocd_insecure", "argocd-insecure")
 	viper.RegisterAlias("app_names", "app-names")
 	viper.RegisterAlias("notification_channel", "notification-channel")
-	viper.RegisterAlias("version_constraint", "version-constraint")
+	viper.RegisterAlias("notify_on", "notify-on")
 	viper.RegisterAlias("output_format", "output-format")
 	viper.RegisterAlias("log_format", "log-format")
 	viper.RegisterAlias("fail_on", "fail-on")
@@ -248,13 +228,13 @@ func validateConfig(cfg *Config) error {
 		}
 	}
 
-	// Validate version constraint
-	if cfg.VersionConstraint != "" && cfg.VersionConstraint != VersionConstraintMajor && cfg.VersionConstraint != VersionConstraintMinor && cfg.VersionConstraint != VersionConstraintPatch {
-		return fmt.Errorf("version_constraint must be one of: '%s', '%s', '%s' (got: '%s')", VersionConstraintMajor, VersionConstraintMinor, VersionConstraintPatch, cfg.VersionConstraint)
+	// Validate notify-on
+	if cfg.NotifyOn != "" && cfg.NotifyOn != NotifyOnMajor && cfg.NotifyOn != NotifyOnMinor && cfg.NotifyOn != NotifyOnPatch {
+		return fmt.Errorf("notify_on must be one of: '%s', '%s', '%s' (got: '%s')", NotifyOnMajor, NotifyOnMinor, NotifyOnPatch, cfg.NotifyOn)
 	}
 	// Normalize empty to "major"
-	if cfg.VersionConstraint == "" {
-		cfg.VersionConstraint = VersionConstraintMajor
+	if cfg.NotifyOn == "" {
+		cfg.NotifyOn = NotifyOnMajor
 	}
 
 	// Validate output format
@@ -295,35 +275,20 @@ func validateConfig(cfg *Config) error {
 
 	// Validate notification channel settings
 	switch cfg.NotificationChannel {
-	case "telegram":
-		if cfg.TelegramWebhook == "" {
-			return fmt.Errorf("telegram_webhook is required when notification_channel is 'telegram'")
-		}
-		if cfg.TelegramChatID == "" {
-			return fmt.Errorf("telegram_chat_id is required when notification_channel is 'telegram'")
-		}
-	case "email":
-		if cfg.EmailSmtpHost == "" {
-			return fmt.Errorf("email_smtp_host is required when notification_channel is 'email'")
-		}
-		if cfg.EmailFrom == "" {
-			return fmt.Errorf("email_from is required when notification_channel is 'email'")
-		}
-		if len(cfg.EmailTo) == 0 {
-			return fmt.Errorf("email_to is required when notification_channel is 'email'")
-		}
-	case "slack":
+	case "":
+		// No channel configured: the results only go to the console
+	case NotificationChannelSlack:
 		if cfg.SlackWebhook == "" {
-			return fmt.Errorf("slack_webhook is required when notification_channel is 'slack'")
+			return fmt.Errorf("slack_webhook is required when notification_channel is '%s'", NotificationChannelSlack)
 		}
-	case "teams":
-		if cfg.TeamsWebhook == "" {
-			return fmt.Errorf("teams_webhook is required when notification_channel is 'teams'")
-		}
-	case "webhook":
+	case NotificationChannelWebhook:
 		if cfg.WebhookURL == "" {
-			return fmt.Errorf("webhook_url is required when notification_channel is 'webhook'")
+			return fmt.Errorf("webhook_url is required when notification_channel is '%s'", NotificationChannelWebhook)
 		}
+	default:
+		// Rejecting an unknown channel keeps a run configured for a removed one
+		// (telegram, email, teams) from silently reporting to nobody.
+		return fmt.Errorf("notification_channel must be one of: '%s', '%s' or empty (got: '%s')", NotificationChannelSlack, NotificationChannelWebhook, cfg.NotificationChannel)
 	}
 
 	return nil

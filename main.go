@@ -16,7 +16,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
-	cmdpkg "argazer/cmd"
 	"argazer/internal/argocd"
 	"argazer/internal/config"
 	"argazer/internal/helm"
@@ -31,9 +30,16 @@ var (
 func main() {
 	var rootCmd = &cobra.Command{
 		Use:   "argazer",
-		Short: "ArgoCD Application Gazer - Monitor Helm chart versions in ArgoCD applications",
-		Long: `Argazer connects to ArgoCD via API and checks all applications for Helm chart updates.
-It can filter by projects, application names, and labels, and send notifications via Telegram, Email, Slack, Microsoft Teams, or generic webhooks.
+		Short: "Read-only Helm update audit for your ArgoCD fleet",
+		Long: `Argazer is a stateless CLI auditor for ArgoCD applications.
+
+It asks the ArgoCD API which Helm charts the applications run, compares them with the
+versions their repositories offer and reports the ones that need a manifest change.
+Nothing is written back to the cluster and no state is kept between runs, which makes a
+single invocation usable from a CI/CD pipeline or a Kubernetes CronJob.
+
+Results can be filtered by projects, application names and labels, printed as a table,
+JSON or Markdown, and pushed to Slack or a generic webhook.
 
 Exit codes: 0 - nothing to report, 1 - the scan could not be completed, 2 - updates matching --fail-on were found.`,
 		RunE: run,
@@ -51,9 +57,6 @@ Exit codes: 0 - nothing to report, 1 - the scan could not be completed, 2 - upda
 		},
 	})
 
-	// Add configure command
-	rootCmd.AddCommand(cmdpkg.NewConfigureCmd())
-
 	// Add flags
 	rootCmd.Flags().StringP("config", "c", "", "Configuration file path")
 	rootCmd.Flags().String("argocd-url", "", "ArgoCD server URL")
@@ -63,9 +66,9 @@ Exit codes: 0 - nothing to report, 1 - the scan could not be completed, 2 - upda
 	rootCmd.Flags().Bool("argocd-insecure", false, "Skip TLS verification")
 	rootCmd.Flags().StringSlice("projects", []string{"*"}, "Projects to check (comma-separated, or '*' for all)")
 	rootCmd.Flags().StringSlice("app-names", []string{"*"}, "Application names to check (comma-separated, or '*' for all)")
-	rootCmd.Flags().String("notification-channel", "", "Notification channel: 'telegram', 'email', 'slack', 'teams', 'webhook', or empty for console only")
+	rootCmd.Flags().String("notification-channel", "", "Notification channel: 'slack', 'webhook', or empty for console only")
 	rootCmd.Flags().Int("concurrency", 10, "Number of concurrent workers for checking applications")
-	rootCmd.Flags().String("version-constraint", "major", "Version constraint: 'major' (all), 'minor' (same major), 'patch' (same major.minor)")
+	rootCmd.Flags().String("notify-on", config.NotifyOnMajor, "Report updates up to: 'major' (all), 'minor' (same major), 'patch' (same major.minor)")
 	rootCmd.Flags().StringP("output-format", "o", "table", "Output format: 'table', 'json', or 'markdown'")
 	rootCmd.Flags().StringP("log-format", "l", "json", "Log format: 'json' or 'text'")
 	rootCmd.Flags().StringP("verbosity", "v", "normal", "Verbosity level: 'full' (all logs), 'normal' (necessary logs), 'off' (only results)")
@@ -271,28 +274,10 @@ func initializeClients(_ context.Context, cfg *config.Config, logger *logrus.Ent
 		var notifier notification.Notifier
 
 		switch cfg.NotificationChannel {
-		case "telegram":
-			notifier = notification.NewTelegramNotifier(cfg.TelegramWebhook, cfg.TelegramChatID, notifierLogger)
-			logger.Info("Using Telegram notifications")
-		case "email":
-			notifier = notification.NewEmailNotifier(
-				cfg.EmailSmtpHost,
-				cfg.EmailSmtpPort,
-				cfg.EmailSmtpUsername,
-				cfg.EmailSmtpPassword,
-				cfg.EmailFrom,
-				cfg.EmailTo,
-				cfg.EmailUseTLS,
-				notifierLogger,
-			)
-			logger.Info("Using Email notifications")
-		case "slack":
+		case config.NotificationChannelSlack:
 			notifier = notification.NewSlackNotifier(cfg.SlackWebhook, notifierLogger)
 			logger.Info("Using Slack notifications")
-		case "teams":
-			notifier = notification.NewTeamsNotifier(cfg.TeamsWebhook, notifierLogger)
-			logger.Info("Using Microsoft Teams notifications")
-		case "webhook":
+		case config.NotificationChannelWebhook:
 			notifier = notification.NewWebhookNotifier(cfg.WebhookURL, notifierLogger)
 			logger.Info("Using generic webhook notifications")
 		default:
@@ -414,14 +399,14 @@ func checkApplication(ctx context.Context, app *argocd.Application, helmChecker 
 		ChartName:         chartName,
 		CurrentVersion:    helmSource.TargetRevision,
 		RepoURL:           helmSource.RepoURL,
-		ConstraintApplied: cfg.VersionConstraint,
+		ConstraintApplied: cfg.NotifyOn,
 	}
 
 	appLogger = appLogger.WithFields(logrus.Fields{
 		"chart_name":    chartName,
 		"chart_version": helmSource.TargetRevision,
 		"repo_url":      helmSource.RepoURL,
-		"constraint":    cfg.VersionConstraint,
+		"constraint":    cfg.NotifyOn,
 	})
 
 	appLogger.Info("Found Helm-based application")
@@ -433,7 +418,7 @@ func checkApplication(ctx context.Context, app *argocd.Application, helmChecker 
 		chartName,
 		app.Spec.Project,
 		helmSource.TargetRevision,
-		cfg.VersionConstraint,
+		cfg.NotifyOn,
 	)
 	if err != nil {
 		appLogger.WithError(err).Error("Failed to check Helm version")
@@ -466,7 +451,7 @@ func checkApplication(ctx context.Context, app *argocd.Application, helmChecker 
 		appLogger.WithFields(logrus.Fields{
 			"current_version":    helmSource.TargetRevision,
 			"latest_version_all": constraintResult.LatestVersionAll,
-			"constraint":         cfg.VersionConstraint,
+			"constraint":         cfg.NotifyOn,
 		}).Info("Application is up to date within constraint, but updates exist outside constraint")
 	default:
 		appLogger.Info("Application is up to date")

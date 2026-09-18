@@ -612,7 +612,7 @@ func TestBuildNotificationMessages(t *testing.T) {
 
 			// Verify each message is not too long
 			for _, msg := range messages {
-				assert.LessOrEqual(t, len(msg), 4096, "Message should not exceed Telegram limit")
+				assert.LessOrEqual(t, len(msg), 4096, "Message should stay within the formatter's chunk limit")
 			}
 		})
 	}
@@ -925,7 +925,7 @@ func TestCheckApplication_MultiSourceValuesRef(t *testing.T) {
 		},
 	}
 
-	cfg := &config.Config{VersionConstraint: config.VersionConstraintMajor}
+	cfg := &config.Config{NotifyOn: config.NotifyOnMajor}
 	result := checkApplication(context.Background(), app, helmChecker, cfg, logger)
 
 	assert.Equal(t, "multi-source-app", result.AppName)

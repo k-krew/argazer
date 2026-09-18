@@ -269,24 +269,55 @@ func TestLoad_NoAuthToken(t *testing.T) {
 	assert.Equal(t, "admin", cfg.ArgocdUsername)
 }
 
-func TestLoad_TelegramValidation(t *testing.T) {
+// TestLoad_NotificationChannelValidation covers the two channels that survived, and makes
+// sure a run configured for a removed one (telegram, email, teams) is rejected instead of
+// quietly reporting to nobody.
+func TestLoad_NotificationChannelValidation(t *testing.T) {
 	tests := []struct {
-		name        string
-		webhook     string
-		chatID      string
-		expectedErr string
+		name         string
+		channel      string
+		slackWebhook string
+		webhookURL   string
+		expectedErr  string
 	}{
 		{
-			name:        "missing webhook",
-			webhook:     "",
-			chatID:      "12345",
-			expectedErr: "telegram_webhook is required",
+			name:    "console only",
+			channel: "",
 		},
 		{
-			name:        "missing chat_id",
-			webhook:     "https://api.telegram.org/bot123/sendMessage",
-			chatID:      "",
-			expectedErr: "telegram_chat_id is required",
+			name:         "slack",
+			channel:      NotificationChannelSlack,
+			slackWebhook: "https://hooks.slack.com/services/T/B/X",
+		},
+		{
+			name:        "slack without webhook",
+			channel:     NotificationChannelSlack,
+			expectedErr: "slack_webhook is required",
+		},
+		{
+			name:       "webhook",
+			channel:    NotificationChannelWebhook,
+			webhookURL: "https://example.com/notify",
+		},
+		{
+			name:        "webhook without url",
+			channel:     NotificationChannelWebhook,
+			expectedErr: "webhook_url is required",
+		},
+		{
+			name:        "removed channel telegram",
+			channel:     "telegram",
+			expectedErr: "notification_channel must be one of",
+		},
+		{
+			name:        "removed channel email",
+			channel:     "email",
+			expectedErr: "notification_channel must be one of",
+		},
+		{
+			name:        "removed channel teams",
+			channel:     "teams",
+			expectedErr: "notification_channel must be one of",
 		},
 	}
 
@@ -299,46 +330,35 @@ func TestLoad_TelegramValidation(t *testing.T) {
 			t.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
 			t.Setenv("AG_ARGOCD_USERNAME", "admin")
 			t.Setenv("AG_ARGOCD_PASSWORD", "password")
-			t.Setenv("AG_NOTIFICATION_CHANNEL", "telegram")
-			t.Setenv("AG_TELEGRAM_WEBHOOK", tt.webhook)
-			t.Setenv("AG_TELEGRAM_CHAT_ID", tt.chatID)
+			t.Setenv("AG_NOTIFICATION_CHANNEL", tt.channel)
+			t.Setenv("AG_SLACK_WEBHOOK", tt.slackWebhook)
+			t.Setenv("AG_WEBHOOK_URL", tt.webhookURL)
 
-			_, err := Load()
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), tt.expectedErr)
+			cfg, err := Load()
+			if tt.expectedErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.expectedErr)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.channel, cfg.NotificationChannel)
 		})
 	}
 }
 
-func TestLoad_EmailValidation(t *testing.T) {
+func TestLoad_NotifyOnValidation(t *testing.T) {
 	tests := []struct {
 		name        string
-		smtpHost    string
-		from        string
-		to          string
+		notifyOn    string
+		expected    string
 		expectedErr string
 	}{
-		{
-			name:        "missing smtp_host",
-			smtpHost:    "",
-			from:        "sender@example.com",
-			to:          "recipient@example.com",
-			expectedErr: "email_smtp_host is required",
-		},
-		{
-			name:        "missing from",
-			smtpHost:    "smtp.example.com",
-			from:        "",
-			to:          "recipient@example.com",
-			expectedErr: "email_from is required",
-		},
-		{
-			name:        "missing to",
-			smtpHost:    "smtp.example.com",
-			from:        "sender@example.com",
-			to:          "",
-			expectedErr: "email_to is required",
-		},
+		{name: "major", notifyOn: NotifyOnMajor, expected: NotifyOnMajor},
+		{name: "minor", notifyOn: NotifyOnMinor, expected: NotifyOnMinor},
+		{name: "patch", notifyOn: NotifyOnPatch, expected: NotifyOnPatch},
+		{name: "empty falls back to major", notifyOn: "", expected: NotifyOnMajor},
+		{name: "invalid value", notifyOn: "everything", expectedErr: "notify_on must be one of"},
 	}
 
 	for _, tt := range tests {
@@ -350,14 +370,17 @@ func TestLoad_EmailValidation(t *testing.T) {
 			t.Setenv("AG_ARGOCD_URL", "https://argocd.example.com")
 			t.Setenv("AG_ARGOCD_USERNAME", "admin")
 			t.Setenv("AG_ARGOCD_PASSWORD", "password")
-			t.Setenv("AG_NOTIFICATION_CHANNEL", "email")
-			t.Setenv("AG_EMAIL_SMTP_HOST", tt.smtpHost)
-			t.Setenv("AG_EMAIL_FROM", tt.from)
-			t.Setenv("AG_EMAIL_TO", tt.to)
+			t.Setenv("AG_NOTIFY_ON", tt.notifyOn)
 
-			_, err := Load()
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), tt.expectedErr)
+			cfg, err := Load()
+			if tt.expectedErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.expectedErr)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, cfg.NotifyOn)
 		})
 	}
 }
@@ -411,6 +434,7 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, []string{"*"}, cfg.Projects)
 	assert.Equal(t, []string{"*"}, cfg.AppNames)
 	assert.Equal(t, map[string]string{}, cfg.Labels)
+	assert.Equal(t, NotifyOnMajor, cfg.NotifyOn)
 	assert.Equal(t, FailOnNone, cfg.FailOn)
 }
 

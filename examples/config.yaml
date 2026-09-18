@@ -42,29 +42,11 @@ labels:
   # team: "platform"
 
 # Notification Channel
-# Options: "telegram", "email", "slack", "teams", "webhook", or leave empty for console-only output
-notification_channel: ""  # "telegram" | "email" | "slack" | "teams" | "webhook" | ""
-
-# Telegram Settings (required if notification_channel is "telegram")
-telegram_webhook: "https://api.telegram.org/botTOKEN/sendMessage"
-telegram_chat_id: "123456789"
-
-# Email Settings (required if notification_channel is "email")
-email_smtp_host: "smtp.gmail.com"
-email_smtp_port: 587
-email_smtp_username: "your-email@gmail.com"
-email_smtp_password: "your-app-password"
-email_from: "argazer@example.com"
-email_to:
-  - "devops@example.com"
-  - "team@example.com"
-email_use_tls: true
+# Options: "slack", "webhook", or leave empty for console-only output
+notification_channel: ""  # "slack" | "webhook" | ""
 
 # Slack Settings (required if notification_channel is "slack")
 slack_webhook: "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
-
-# Microsoft Teams Settings (required if notification_channel is "teams")
-teams_webhook: "https://outlook.office.com/webhook/YOUR/WEBHOOK/URL"
 
 # Generic Webhook Settings (required if notification_channel is "webhook")
 # Sends a JSON payload with "subject" and "message" fields
@@ -75,12 +57,12 @@ verbosity: "normal"  # "normal" | "full" | "off"
 source_name: "chart-repo"  # For multi-source applications
 concurrency: 10  # Number of concurrent workers for checking applications
 
-# Version Constraint Strategy
-# Controls which version updates to check for
-# - "major": Check all versions (default) - any major, minor, or patch updates
-# - "minor": Only check same major version - minor and patch updates only
-# - "patch": Only check same major.minor - patch updates only
-version_constraint: "major"
+# Notify On
+# Controls which version updates to report
+# - "major": Report all versions (default) - any major, minor, or patch updates
+# - "minor": Only the same major version - minor and patch updates only
+# - "patch": Only the same major.minor - patch updates only
+notify_on: "major"
 
 # Output Format
 # Controls how application check results are displayed
