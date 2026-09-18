@@ -26,6 +26,21 @@ const (
 	UpdateTypePinned = "pinned"
 )
 
+// Bump levels describe how big the step between two versions is.
+const (
+	// BumpNone means the target version is not newer than the current one.
+	BumpNone = "none"
+	// BumpPatch means only the patch (or prerelease) part changes.
+	BumpPatch = "patch"
+	// BumpMinor means the minor part changes within the same major.
+	BumpMinor = "minor"
+	// BumpMajor means the major part changes.
+	BumpMajor = "major"
+	// BumpUnknown means at least one of the versions holds no parseable version, so the
+	// step between them cannot be classified.
+	BumpUnknown = "unknown"
+)
+
 // VersionConstraintResult holds the result of version constraint filtering
 type VersionConstraintResult struct {
 	LatestVersion              string // Latest version within constraint
@@ -299,4 +314,39 @@ func normalizeVersionLiteral(literal string) string {
 	}
 
 	return strings.NewReplacer("x", "0", "X", "0", "*", "0").Replace(core) + suffix
+}
+
+// BumpType classifies the step from one version to another. Both arguments may be plain
+// versions or targetRevision ranges; a range is represented by the lowest version it can
+// match, so "~1.2.0" -> "2.0.0" is a major bump. BumpUnknown is returned when either side
+// holds no parseable version, e.g. when targetRevision points at a git branch.
+func BumpType(from, to string) string {
+	fromVer := parseVersionOrRangeBound(from)
+	toVer := parseVersionOrRangeBound(to)
+	if fromVer == nil || toVer == nil {
+		return BumpUnknown
+	}
+
+	if !toVer.GreaterThan(fromVer) {
+		return BumpNone
+	}
+
+	switch {
+	case toVer.Major() != fromVer.Major():
+		return BumpMajor
+	case toVer.Minor() != fromVer.Minor():
+		return BumpMinor
+	default:
+		return BumpPatch
+	}
+}
+
+// parseVersionOrRangeBound parses a plain version, falling back to the lower bound of a
+// range expression. Nil is returned when neither is parseable.
+func parseVersionOrRangeBound(version string) *semver.Version {
+	if parsed, err := semver.NewVersion(version); err == nil {
+		return parsed
+	}
+
+	return rangeLowerBound(version)
 }

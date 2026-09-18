@@ -17,6 +17,7 @@
 - **Controllable verbosity** - Adjust output noise using the `--verbosity` flag (`normal`, `full`, or `off`).
 - **Flexible filtering** - Filter by projects, application names, and labels.
 - **Semantic version constraints** - Only notify on `patch`, `minor`, or `major` updates.
+- **CI/CD quality gate** - Granular exit codes plus `--fail-on` to fail a pipeline on the updates you care about.
 - **Multiple notification channels** - Telegram, Email, Slack, Microsoft Teams, or Generic Webhooks.
 - **Graceful error handling & retries** - Reliable notifications with exponential backoff on network failures.
 
@@ -106,6 +107,31 @@ Control which updates trigger notifications based on semantic versioning:
 ./argazer --version-constraint="patch"
 ```
 
+### Exit Codes and CI/CD Gating
+
+Argazer reports the outcome of a scan through its exit code:
+
+| Code | Meaning |
+|------|---------|
+| `0` | Nothing to report |
+| `1` | The scan could not be completed (ArgoCD unreachable, bad configuration, or an application that could not be checked) |
+| `2` | Updates matching `--fail-on` were found |
+
+By default (`--fail-on=none`) updates are only reported, which is what you want for a CronJob. Use `--fail-on` to turn a pipeline step into a quality gate; it reacts to updates of the given severity **and above**:
+
+```bash
+# Fail the pipeline on any update that requires a manifest change
+./argazer --fail-on="any"
+
+# Fail only on major updates (e.g. 1.2.3 -> 2.0.0)
+./argazer --fail-on="major"
+
+# Fail on minor and major updates, ignore patches
+./argazer --fail-on="minor"
+```
+
+Severity is measured against the version an application would move to, so for a `targetRevision` range it is the newest version beyond that range. Updates ArgoCD applies on its own (a newer version inside the range) never fail the run, and neither do updates whose severity cannot be determined, e.g. for a `targetRevision` pointing at a Git branch — those only count for `--fail-on=any`.
+
 ## Configuration
 
 Argazer can be configured via a `config.yaml` file, CLI flags, or environment variables (`AG_` prefix).
@@ -136,6 +162,7 @@ telegram_chat_id: "123456789"
 verbosity: "normal"
 version_constraint: "major"
 output_format: "table"
+fail_on: "none"
 ```
 
 ### Environment Variables

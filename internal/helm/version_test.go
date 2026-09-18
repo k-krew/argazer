@@ -408,3 +408,35 @@ func TestFindLatestSemverWithNonSemverRevision(t *testing.T) {
 		})
 	}
 }
+
+func TestBumpType(t *testing.T) {
+	tests := []struct {
+		name     string
+		from     string
+		to       string
+		expected string
+	}{
+		{name: "major bump", from: "1.2.3", to: "2.0.0", expected: BumpMajor},
+		{name: "minor bump", from: "1.2.3", to: "1.3.0", expected: BumpMinor},
+		{name: "patch bump", from: "1.2.3", to: "1.2.4", expected: BumpPatch},
+		{name: "prerelease to release counts as patch", from: "1.2.3-rc1", to: "1.2.3", expected: BumpPatch},
+		{name: "v prefix is accepted", from: "v1.2.3", to: "v1.9.0", expected: BumpMinor},
+		{name: "same version", from: "1.2.3", to: "1.2.3", expected: BumpNone},
+		{name: "older target version", from: "2.0.0", to: "1.9.9", expected: BumpNone},
+		{name: "tilde range widened to next major", from: "~1.2.0", to: "2.0.0", expected: BumpMajor},
+		{name: "caret range widened to next minor", from: "^1.2.0", to: "1.5.0", expected: BumpMinor},
+		{name: "wildcard range widened to next patch", from: "1.2.*", to: "1.2.7", expected: BumpPatch},
+		{name: "multi bound range uses its lower bound", from: ">= 1.2.0, < 1.4.0", to: "1.4.0", expected: BumpMinor},
+		{name: "branch as current revision", from: "main", to: "2.0.0", expected: BumpUnknown},
+		{name: "branch as target version", from: "1.2.3", to: "main", expected: BumpUnknown},
+		{name: "empty versions", from: "", to: "", expected: BumpUnknown},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if bump := BumpType(test.from, test.to); bump != test.expected {
+				t.Errorf("BumpType(%q, %q) = %s, expected %s", test.from, test.to, bump, test.expected)
+			}
+		})
+	}
+}

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"testing"
@@ -795,4 +797,244 @@ func TestSendNotifications_MultipleMessages(t *testing.T) {
 	err := sendNotifications(context.Background(), notifier, results, logger)
 	require.NoError(t, err)
 	assert.True(t, notifier.SendCalled)
+}
+
+// pinnedUpdate builds a result for an application pinned to currentVersion with a newer
+// version available, i.e. an update someone has to apply by hand.
+func pinnedUpdate(currentVersion, latestVersion string) ApplicationCheckResult {
+	return ApplicationCheckResult{
+		AppName:        "app",
+		ChartName:      "chart",
+		CurrentVersion: currentVersion,
+		LatestVersion:  latestVersion,
+		HasUpdate:      true,
+		UpdateType:     helm.UpdateTypePinned,
+	}
+}
+
+func TestDetermineExitCode(t *testing.T) {
+	upToDate := ApplicationCheckResult{
+		AppName:        "up-to-date-app",
+		CurrentVersion: "1.0.0",
+		LatestVersion:  "1.0.0",
+		UpdateType:     helm.UpdateTypeNone,
+	}
+	inRange := ApplicationCheckResult{
+		AppName:        "in-range-app",
+		CurrentVersion: "^1.0.0",
+		LatestVersion:  "1.4.0",
+		UpdateType:     helm.UpdateTypeInRange,
+	}
+	failedApp := ApplicationCheckResult{
+		AppName: "unreachable-app",
+		Error:   "failed to fetch index.yaml",
+	}
+
+	tests := []struct {
+		name     string
+		results  []ApplicationCheckResult
+		failOn   string
+		expected int
+	}{
+		{
+			name:     "no applications at all",
+			failOn:   config.FailOnAny,
+			expected: exitCodeClean,
+		},
+		{
+			name:     "everything up to date",
+			results:  []ApplicationCheckResult{upToDate, inRange},
+			failOn:   config.FailOnAny,
+			expected: exitCodeClean,
+		},
+		{
+			name:     "updates are ignored when fail-on is none",
+			results:  []ApplicationCheckResult{pinnedUpdate("1.0.0", "3.0.0")},
+			failOn:   config.FailOnNone,
+			expected: exitCodeClean,
+		},
+		{
+			name:     "updates are ignored when fail-on is unset",
+			results:  []ApplicationCheckResult{pinnedUpdate("1.0.0", "3.0.0")},
+			failOn:   "",
+			expected: exitCodeClean,
+		},
+		{
+			name:     "an update ArgoCD applies itself does not fail the run",
+			results:  []ApplicationCheckResult{inRange},
+			failOn:   config.FailOnAny,
+			expected: exitCodeClean,
+		},
+		{
+			name:     "unchecked application fails the scan",
+			results:  []ApplicationCheckResult{upToDate, failedApp},
+			failOn:   config.FailOnNone,
+			expected: exitCodeScanFailed,
+		},
+		{
+			name:     "unchecked application wins over found updates",
+			results:  []ApplicationCheckResult{pinnedUpdate("1.0.0", "2.0.0"), failedApp},
+			failOn:   config.FailOnAny,
+			expected: exitCodeScanFailed,
+		},
+		{
+			name:     "non-Helm applications are neither updates nor failures",
+			results:  []ApplicationCheckResult{{}, {}},
+			failOn:   config.FailOnAny,
+			expected: exitCodeClean,
+		},
+		{
+			name:     "update found with fail-on any",
+			results:  []ApplicationCheckResult{pinnedUpdate("1.0.0", "1.0.1")},
+			failOn:   config.FailOnAny,
+			expected: exitCodeUpdatesFound,
+		},
+		{
+			name:     "unknown fail-on value never fails the run",
+			results:  []ApplicationCheckResult{pinnedUpdate("1.0.0", "2.0.0")},
+			failOn:   "everything",
+			expected: exitCodeClean,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.expected, determineExitCode(test.results, test.failOn))
+		})
+	}
+}
+
+// TestDetermineExitCode_FailOnSeverity checks that a --fail-on value reacts to the updates
+// of that severity and to the bigger ones, but not to the smaller ones.
+func TestDetermineExitCode_FailOnSeverity(t *testing.T) {
+	tests := []struct {
+		name   string
+		update ApplicationCheckResult
+		failOn map[string]int
+	}{
+		{
+			name:   "major update",
+			update: pinnedUpdate("1.2.3", "2.0.0"),
+			failOn: map[string]int{
+				config.FailOnMajor: exitCodeUpdatesFound,
+				config.FailOnMinor: exitCodeUpdatesFound,
+				config.FailOnPatch: exitCodeUpdatesFound,
+			},
+		},
+		{
+			name:   "minor update",
+			update: pinnedUpdate("1.2.3", "1.3.0"),
+			failOn: map[string]int{
+				config.FailOnMajor: exitCodeClean,
+				config.FailOnMinor: exitCodeUpdatesFound,
+				config.FailOnPatch: exitCodeUpdatesFound,
+			},
+		},
+		{
+			name:   "patch update",
+			update: pinnedUpdate("1.2.3", "1.2.4"),
+			failOn: map[string]int{
+				config.FailOnMajor: exitCodeClean,
+				config.FailOnMinor: exitCodeClean,
+				config.FailOnPatch: exitCodeUpdatesFound,
+			},
+		},
+		{
+			name: "update beyond the target range is measured against the newest version overall",
+			update: ApplicationCheckResult{
+				AppName:          "ranged-app",
+				CurrentVersion:   "~1.2.0",
+				LatestVersion:    "1.2.9",
+				LatestVersionAll: "2.1.0",
+				HasUpdate:        true,
+				UpdateType:       helm.UpdateTypeOutOfRange,
+			},
+			failOn: map[string]int{
+				config.FailOnMajor: exitCodeUpdatesFound,
+				config.FailOnMinor: exitCodeUpdatesFound,
+				config.FailOnPatch: exitCodeUpdatesFound,
+			},
+		},
+		{
+			name:   "severity of an update for a branch revision cannot be told",
+			update: pinnedUpdate("main", "2.0.0"),
+			failOn: map[string]int{
+				config.FailOnMajor: exitCodeClean,
+				config.FailOnMinor: exitCodeClean,
+				config.FailOnPatch: exitCodeClean,
+				config.FailOnAny:   exitCodeUpdatesFound,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for failOn, expected := range test.failOn {
+				assert.Equal(t, expected, determineExitCode([]ApplicationCheckResult{test.update}, failOn),
+					"fail-on=%s", failOn)
+			}
+		})
+	}
+}
+
+// TestDetermineExitCode_MixedSeverities makes sure the most severe update in the scan
+// decides the outcome, no matter where it sits in the results.
+func TestDetermineExitCode_MixedSeverities(t *testing.T) {
+	results := []ApplicationCheckResult{
+		pinnedUpdate("1.2.3", "1.2.4"),
+		pinnedUpdate("1.2.3", "1.3.0"),
+		pinnedUpdate("1.2.3", "1.2.5"),
+	}
+
+	assert.Equal(t, exitCodeUpdatesFound, determineExitCode(results, config.FailOnMinor))
+	assert.Equal(t, exitCodeClean, determineExitCode(results, config.FailOnMajor))
+}
+
+func TestUpdateTarget(t *testing.T) {
+	tests := []struct {
+		name     string
+		result   ApplicationCheckResult
+		expected string
+	}{
+		{
+			name:     "pinned revision uses the latest version",
+			result:   pinnedUpdate("1.0.0", "1.5.0"),
+			expected: "1.5.0",
+		},
+		{
+			name: "revision beyond the range uses the latest version overall",
+			result: ApplicationCheckResult{
+				CurrentVersion:   "~1.2.0",
+				LatestVersion:    "1.2.9",
+				LatestVersionAll: "3.0.0",
+				UpdateType:       helm.UpdateTypeOutOfRange,
+			},
+			expected: "3.0.0",
+		},
+		{
+			name: "revision beyond the range without a known latest version overall",
+			result: ApplicationCheckResult{
+				CurrentVersion: "~1.2.0",
+				LatestVersion:  "1.2.9",
+				UpdateType:     helm.UpdateTypeOutOfRange,
+			},
+			expected: "1.2.9",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.expected, updateTarget(test.result))
+		})
+	}
+}
+
+func TestExitError(t *testing.T) {
+	err := &exitError{code: exitCodeUpdatesFound, message: "updates were found"}
+
+	assert.EqualError(t, err, "updates were found")
+
+	var exitErr *exitError
+	require.True(t, errors.As(fmt.Errorf("wrapped: %w", err), &exitErr))
+	assert.Equal(t, exitCodeUpdatesFound, exitErr.code)
 }

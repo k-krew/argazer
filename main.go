@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -34,8 +35,13 @@ func main() {
 		Use:   "argazer",
 		Short: "ArgoCD Application Gazer - Monitor Helm chart versions in ArgoCD applications",
 		Long: `Argazer connects to ArgoCD via API and checks all applications for Helm chart updates.
-It can filter by projects, application names, and labels, and send notifications via Telegram, Email, Slack, Microsoft Teams, or generic webhooks.`,
+It can filter by projects, application names, and labels, and send notifications via Telegram, Email, Slack, Microsoft Teams, or generic webhooks.
+
+Exit codes: 0 - nothing to report, 1 - the scan could not be completed, 2 - updates matching --fail-on were found.`,
 		RunE: run,
+		// Failures are reported by the logger and turned into an exit code below
+		SilenceErrors: true,
+		SilenceUsage:  true,
 	}
 
 	// Add version command
@@ -64,6 +70,7 @@ It can filter by projects, application names, and labels, and send notifications
 	rootCmd.Flags().StringP("output-format", "o", "table", "Output format: 'table', 'json', or 'markdown'")
 	rootCmd.Flags().StringP("log-format", "l", "json", "Log format: 'json' or 'text'")
 	rootCmd.Flags().StringP("verbosity", "v", "normal", "Verbosity level: 'full' (all logs), 'normal' (necessary logs), 'off' (only results)")
+	rootCmd.Flags().String("fail-on", config.FailOnNone, "Exit with code 2 when updates of this severity or higher are found: 'none' (never), 'any', 'patch', 'minor', 'major'")
 
 	// Bind flags to viper
 	if err := viper.BindPFlags(rootCmd.Flags()); err != nil {
@@ -71,6 +78,10 @@ It can filter by projects, application names, and labels, and send notifications
 	}
 
 	if err := rootCmd.Execute(); err != nil {
+		var exitErr *exitError
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.code)
+		}
 		logrus.Fatal(err)
 	}
 }
@@ -127,7 +138,104 @@ func run(cmd *cobra.Command, args []string) error {
 
 	logger.WithField("total_checked", len(results)).Info("Argazer completed")
 
+	switch code := determineExitCode(results, cfg.FailOn); code {
+	case exitCodeScanFailed:
+		logger.Warn("Some applications could not be checked, exiting with code 1")
+		return &exitError{code: code, message: "some applications could not be checked"}
+	case exitCodeUpdatesFound:
+		logger.WithField("fail_on", cfg.FailOn).Warn("Updates matching --fail-on were found, exiting with code 2")
+		return &exitError{code: code, message: fmt.Sprintf("updates matching --fail-on=%s were found", cfg.FailOn)}
+	}
+
 	return nil
+}
+
+// Exit codes returned to the shell, so Argazer can act as a CI/CD quality gate.
+const (
+	exitCodeClean        = 0 // Nothing to report
+	exitCodeScanFailed   = 1 // The scan itself could not be completed
+	exitCodeUpdatesFound = 2 // Updates matching --fail-on were found
+)
+
+// exitError carries an exit code out of run. Any other error leaving run exits with
+// exitCodeScanFailed.
+type exitError struct {
+	code    int
+	message string
+}
+
+func (e *exitError) Error() string {
+	return e.message
+}
+
+// determineExitCode maps the outcome of a scan to a process exit code. An incomplete scan
+// wins over found updates: a run that could not check everything says nothing reliable
+// about the applications it did not reach.
+func determineExitCode(results []ApplicationCheckResult, failOn string) int {
+	cat := processResults(results)
+
+	if cat.stats.skipped > 0 {
+		return exitCodeScanFailed
+	}
+
+	if failsOn(cat.updatesAvailable, failOn) {
+		return exitCodeUpdatesFound
+	}
+
+	return exitCodeClean
+}
+
+// bumpSeverity ranks how big an update is. A bump that cannot be classified gets the
+// lowest rank, so it never reaches a threshold.
+var bumpSeverity = map[string]int{
+	helm.BumpPatch: 1,
+	helm.BumpMinor: 2,
+	helm.BumpMajor: 3,
+}
+
+// failOnThreshold is the lowest severity each --fail-on value reacts to: asking to fail on
+// minor updates also covers the major ones.
+var failOnThreshold = map[string]int{
+	config.FailOnPatch: bumpSeverity[helm.BumpPatch],
+	config.FailOnMinor: bumpSeverity[helm.BumpMinor],
+	config.FailOnMajor: bumpSeverity[helm.BumpMajor],
+}
+
+// failsOn reports whether any of the available updates is severe enough for the given
+// --fail-on value. Updates whose severity cannot be determined (a targetRevision pointing
+// at a branch, for instance) only count for 'any'.
+func failsOn(updates []ApplicationCheckResult, failOn string) bool {
+	if len(updates) == 0 || failOn == "" || failOn == config.FailOnNone {
+		return false
+	}
+
+	if failOn == config.FailOnAny {
+		return true
+	}
+
+	threshold, ok := failOnThreshold[failOn]
+	if !ok {
+		return false
+	}
+
+	for _, update := range updates {
+		if bumpSeverity[helm.BumpType(update.CurrentVersion, updateTarget(update))] >= threshold {
+			return true
+		}
+	}
+
+	return false
+}
+
+// updateTarget returns the version an application would end up on once the update is
+// applied. For a revision beyond the target range that is the newest version overall,
+// since the range has to be widened past everything it allows.
+func updateTarget(result ApplicationCheckResult) string {
+	if result.UpdateType == helm.UpdateTypeOutOfRange && result.LatestVersionAll != "" {
+		return result.LatestVersionAll
+	}
+
+	return result.LatestVersion
 }
 
 // clients holds all initialized clients

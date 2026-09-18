@@ -21,6 +21,15 @@ const (
 	VersionConstraintPatch = "patch"
 )
 
+// Fail-on constants: the lowest update severity that makes the run exit with code 2
+const (
+	FailOnNone  = "none"  // Never fail because of updates
+	FailOnAny   = "any"   // Fail on any update, including unclassifiable ones
+	FailOnPatch = "patch" // Fail on patch updates and above
+	FailOnMinor = "minor" // Fail on minor updates and above
+	FailOnMajor = "major" // Fail on major updates only
+)
+
 // Log format constants
 const (
 	LogFormatJSON = "json"
@@ -79,6 +88,7 @@ type Config struct {
 	Concurrency       int    `mapstructure:"concurrency"`        // Number of concurrent workers for checking applications
 	VersionConstraint string `mapstructure:"version_constraint"` // Version constraint: "major", "minor", "patch" (default: "major")
 	OutputFormat      string `mapstructure:"output_format"`      // Output format: "table", "json", "markdown" (default: "table")
+	FailOn            string `mapstructure:"fail_on"`            // Exit with code 2 on updates of this severity or higher: "none", "any", "patch", "minor", "major" (default: "none")
 
 	// Repository authentication
 	RepositoryAuth []RepositoryAuth `mapstructure:"repository_auth"`
@@ -127,6 +137,7 @@ func setDefaults() {
 	viper.SetDefault("source_name", "chart-repo")
 	viper.SetDefault("version_constraint", VersionConstraintMajor)
 	viper.SetDefault("output_format", OutputFormatTable)
+	viper.SetDefault("fail_on", FailOnNone)
 	viper.SetDefault("log_format", LogFormatJSON)
 	viper.SetDefault("argocd_url", "")
 	viper.SetDefault("argocd_username", "")
@@ -217,6 +228,7 @@ func registerFlagAliases() {
 	viper.RegisterAlias("version_constraint", "version-constraint")
 	viper.RegisterAlias("output_format", "output-format")
 	viper.RegisterAlias("log_format", "log-format")
+	viper.RegisterAlias("fail_on", "fail-on")
 }
 
 // validateConfig validates the loaded configuration
@@ -248,6 +260,16 @@ func validateConfig(cfg *Config) error {
 	// Normalize empty to "table"
 	if cfg.OutputFormat == "" {
 		cfg.OutputFormat = OutputFormatTable
+	}
+
+	// Validate fail-on policy
+	switch cfg.FailOn {
+	case "":
+		// Normalize empty to "none": exit code 2 is opt-in
+		cfg.FailOn = FailOnNone
+	case FailOnNone, FailOnAny, FailOnPatch, FailOnMinor, FailOnMajor:
+	default:
+		return fmt.Errorf("fail_on must be one of: '%s', '%s', '%s', '%s', '%s' (got: '%s')", FailOnNone, FailOnAny, FailOnPatch, FailOnMinor, FailOnMajor, cfg.FailOn)
 	}
 
 	// Validate log format
