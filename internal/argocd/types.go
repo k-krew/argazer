@@ -46,7 +46,7 @@ type ApplicationStatus struct {
 // ApplicationSource is one place an Application takes manifests from.
 type ApplicationSource struct {
 	// Name is how a source of a multi-source Application is referred to, and is what
-	// --source-name picks a source by.
+	// source_name picks a source by.
 	Name string `json:"name,omitempty"`
 
 	// RepoURL is the repository as ArgoCD knows it, which is also the string its

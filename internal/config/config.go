@@ -75,7 +75,7 @@ type Config struct {
 	// General settings
 	Verbosity    string `mapstructure:"verbosity"`
 	LogFormat    string `mapstructure:"log_format"`    // Log format: "json" or "text" (default: "json")
-	SourceName   string `mapstructure:"source_name"`   // Name of the source to check in multi-source applications
+	SourceName   string `mapstructure:"source_name"`   // Optional: narrows a multi-source application down to the source of this name
 	Concurrency  int    `mapstructure:"concurrency"`   // Number of concurrent workers for checking applications
 	NotifyOn     string `mapstructure:"notify_on"`     // Widest bump to report: "major", "minor", "patch" (default: "major")
 	OutputFormat string `mapstructure:"output_format"` // Output format: "table", "json", "markdown" (default: "table")
@@ -113,7 +113,7 @@ func setDefaults() {
 	viper.SetDefault("concurrency", 10)
 
 	// String defaults
-	viper.SetDefault("source_name", "chart-repo")
+	viper.SetDefault("source_name", "")
 	viper.SetDefault("notify_on", NotifyOnMajor)
 	viper.SetDefault("output_format", OutputFormatTable)
 	viper.SetDefault("fail_on", FailOnNone)

@@ -1267,7 +1267,7 @@ func TestCheckApplication_MultipleCharts(t *testing.T) {
 	}, versionSource.requests, "each chart is looked up once, the values source not at all")
 }
 
-// TestCheckApplication_MultipleChartsWithSourceName checks that --source-name still narrows
+// TestCheckApplication_MultipleChartsWithSourceName checks that source_name still narrows
 // a multi-chart application down to the single chart it names.
 func TestCheckApplication_MultipleChartsWithSourceName(t *testing.T) {
 	logger := logrus.NewEntry(logrus.New())

@@ -54,7 +54,7 @@ webhook_url: "https://your-webhook-endpoint.example.com/notify"
 
 # General Settings
 verbosity: "off"  # "normal" | "full" | "off"
-source_name: "chart-repo"  # For multi-source applications
+# source_name: "chart-repo"  # Optional: for multi-source applications, check only the source with this name
 concurrency: 10  # Number of concurrent workers for checking applications
 
 # Notify On

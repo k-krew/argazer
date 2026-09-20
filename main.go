@@ -541,9 +541,9 @@ func findHelmSources(app *argocd.Application, sourceName string, logger *logrus.
 		return []*argocd.ApplicationSource{app.Spec.Source}
 	}
 
-	// --source-name narrows a multi-source Application down to the one source it names,
+	// source_name narrows a multi-source Application down to the one source it names,
 	// which is the answer on its own. A name that matches nothing is no answer at all, and
-	// the Application is looked through as if the flag had not been given.
+	// the Application is looked through as if the setting had not been given.
 	if sourceName != "" {
 		for i := range app.Spec.Sources {
 			source := &app.Spec.Sources[i]

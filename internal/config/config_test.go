@@ -430,7 +430,7 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, "off", cfg.Verbosity)
 	assert.False(t, cfg.ArgocdInsecure)
 	assert.Equal(t, 10, cfg.Concurrency)
-	assert.Equal(t, "chart-repo", cfg.SourceName)
+	assert.Empty(t, cfg.SourceName)
 	assert.Equal(t, []string{"*"}, cfg.Projects)
 	assert.Equal(t, []string{"*"}, cfg.AppNames)
 	assert.Equal(t, map[string]string{}, cfg.Labels)
