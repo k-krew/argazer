@@ -13,13 +13,15 @@ import (
 )
 
 // TestListOCITags checks the request Argazer sends and the answer it reads back: the
-// artifact is a single path segment even though it holds slashes, the project travels as a
-// query parameter, and the token authenticates the call.
+// artifact reaches ArgoCD with the oci:// scheme its endpoint needs and as a single path
+// segment even though it holds slashes, the project travels as a query parameter, and the
+// token authenticates the call.
 func TestListOCITags(t *testing.T) {
-	var gotPath, gotRawQuery, gotAuthorization string
+	var gotPath, gotDecodedPath, gotRawQuery, gotAuthorization string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.EscapedPath()
+		gotDecodedPath = r.URL.Path
 		gotRawQuery = r.URL.RawQuery
 		gotAuthorization = r.Header.Get("Authorization")
 
@@ -34,14 +36,17 @@ func TestListOCITags(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"1.20.0", "1.21.0"}, tags)
 
-	assert.Equal(t, "/api/v1/repositories/ghcr.io%2Fmyorg%2Fcharts%2Fnginx/oci-tags", gotPath)
+	assert.Equal(t, "/api/v1/repositories/oci:%2F%2Fghcr.io%2Fmyorg%2Fcharts%2Fnginx/oci-tags", gotPath)
 	assert.Equal(t, "appProject=team-a", gotRawQuery)
 	assert.Equal(t, "Bearer a-token", gotAuthorization)
+
+	// Escaping aside, ArgoCD reads one repository URL carrying the scheme and the path.
+	assert.Equal(t, "/api/v1/repositories/oci://ghcr.io/myorg/charts/nginx/oci-tags", gotDecodedPath)
 }
 
 // TestListOCITags_ArtifactWithScheme checks that an artifact named with the oci:// scheme
-// reaches ArgoCD with the scheme intact, since that is the URL a repository registered that
-// way is known by.
+// reaches ArgoCD with that one scheme: the endpoint needs it, and adding another one would
+// leave the artifact unknown to ArgoCD.
 func TestListOCITags_ArtifactWithScheme(t *testing.T) {
 	var gotPath string
 
@@ -219,6 +224,12 @@ func TestOCIArtifact(t *testing.T) {
 			expected:  "oci://ghcr.io/myorg/nginx",
 		},
 		{
+			name:      "the scheme is recognised whatever its case",
+			repoURL:   "OCI://ghcr.io/myorg/nginx",
+			chartName: "nginx",
+			expected:  "OCI://ghcr.io/myorg/nginx",
+		},
+		{
 			name:      "surrounding slashes are dropped",
 			repoURL:   "ghcr.io/myorg/charts/",
 			chartName: "/nginx",
@@ -240,6 +251,44 @@ func TestOCIArtifact(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.expected, ociArtifact(tt.repoURL, tt.chartName))
+		})
+	}
+}
+
+// TestOCIRepositoryURL checks the repository URL the oci-tags endpoint is asked with: the
+// scheme is what the endpoint reads the registry from, and an artifact that already names it
+// must not end up with a second one.
+func TestOCIRepositoryURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		artifact string
+		expected string
+	}{
+		{
+			name:     "a bare registry path gets the scheme the endpoint needs",
+			artifact: "ghcr.io/myorg/charts/nginx",
+			expected: "oci://ghcr.io/myorg/charts/nginx",
+		},
+		{
+			name:     "a registry without a path gets it as well",
+			artifact: "registry.example.com/nginx",
+			expected: "oci://registry.example.com/nginx",
+		},
+		{
+			name:     "an artifact naming the scheme keeps the one it has",
+			artifact: "oci://ghcr.io/myorg/nginx",
+			expected: "oci://ghcr.io/myorg/nginx",
+		},
+		{
+			name:     "the scheme is recognised whatever its case",
+			artifact: "OCI://ghcr.io/myorg/nginx",
+			expected: "OCI://ghcr.io/myorg/nginx",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, ociRepositoryURL(tt.artifact))
 		})
 	}
 }

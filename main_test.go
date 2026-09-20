@@ -128,6 +128,21 @@ func TestFindHelmSource(t *testing.T) {
 			expected:   true,
 		},
 		{
+			// ArgoCD also takes an OCI chart as a repository URL that names it in full,
+			// which leaves the application without a chart field to recognise it by.
+			name: "single source with an oci chart url",
+			app: &argocd.Application{
+				Spec: argocd.ApplicationSpec{
+					Source: &argocd.ApplicationSource{
+						RepoURL:        "oci://ghcr.io/stefanprodan/charts/podinfo",
+						TargetRevision: "6.5.0",
+					},
+				},
+			},
+			sourceName: "",
+			expected:   true,
+		},
+		{
 			name: "multi-source no helm charts",
 			app: &argocd.Application{
 				Spec: argocd.ApplicationSpec{
@@ -241,6 +256,27 @@ func TestFindHelmSource_MultiSource(t *testing.T) {
 				{Name: "git-chart", RepoURL: "https://github.com/example/charts.git", Path: "charts/my-chart", Helm: &argocd.ApplicationSourceHelm{}},
 			},
 			expectedRepoURL: "https://github.com/example/charts.git",
+		},
+		{
+			name:            "an oci url without a chart field is the chart source",
+			sources:         []argocd.ApplicationSource{valuesRef, {Name: "oci-chart", RepoURL: "oci://ghcr.io/myorg/charts/nginx", TargetRevision: "1.2.3"}},
+			expectedRepoURL: "oci://ghcr.io/myorg/charts/nginx",
+		},
+		{
+			// The chart has to win over a Git source carrying Helm options no matter which
+			// of the two is listed first, the same as a chart named by a chart field does.
+			name: "an oci chart wins over a chart in a Git repository",
+			sources: []argocd.ApplicationSource{
+				{Name: "git-chart", RepoURL: "https://github.com/example/charts.git", Path: "charts/my-chart", Helm: &argocd.ApplicationSourceHelm{}},
+				{Name: "oci-chart", RepoURL: "oci://ghcr.io/myorg/charts/nginx", TargetRevision: "1.2.3"},
+			},
+			expectedRepoURL: "oci://ghcr.io/myorg/charts/nginx",
+		},
+		{
+			name:            "the named oci chart wins over the other charts",
+			sources:         []argocd.ApplicationSource{chart, {Name: "oci-chart", RepoURL: "oci://ghcr.io/myorg/charts/nginx"}},
+			sourceName:      "oci-chart",
+			expectedRepoURL: "oci://ghcr.io/myorg/charts/nginx",
 		},
 		{
 			name:    "nothing but a values ref is no Helm source",

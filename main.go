@@ -469,10 +469,18 @@ func requiresManualUpdate(updateType string) bool {
 
 // findHelmSource finds the Helm source in an ArgoCD application
 func findHelmSource(app *argocd.Application, sourceName string, logger *logrus.Entry) *argocd.ApplicationSource {
+	// A source that is a chart of its own, rather than a chart kept in a Git repository.
+	// ArgoCD lets an Application name an OCI chart in two ways: as a registry path plus a
+	// `chart`, or as a single `repoURL: oci://...` naming the chart already, which is why the
+	// scheme counts as much as the chart field does.
+	isChartSource := func(source *argocd.ApplicationSource) bool {
+		return source.Chart != "" || strings.HasPrefix(strings.ToLower(source.RepoURL), "oci://")
+	}
+
 	// Helper function to check if a source is Helm-based
 	isHelmSource := func(source *argocd.ApplicationSource) bool {
-		// Check if it's a Helm repository source (has Chart field)
-		if source.Chart != "" {
+		// Check if it's a chart source (a Helm repository with a chart, or an OCI chart)
+		if isChartSource(source) {
 			return true
 		}
 		// Check if it's a Git repository with Helm (has Helm parameters)
@@ -486,7 +494,7 @@ func findHelmSource(app *argocd.Application, sourceName string, logger *logrus.E
 	// sources point at (the `ref: values` pattern). ArgoCD renders nothing from it, and it
 	// has no chart version to look up, so it is never the Helm source.
 	isValuesRef := func(source *argocd.ApplicationSource) bool {
-		return source.Ref != "" && source.Chart == ""
+		return source.Ref != "" && !isChartSource(source)
 	}
 
 	found := func(source *argocd.ApplicationSource, message string) *argocd.ApplicationSource {
@@ -518,7 +526,7 @@ func findHelmSource(app *argocd.Application, sourceName string, logger *logrus.E
 	}
 
 	for i := range app.Spec.Sources {
-		if source := &app.Spec.Sources[i]; source.Chart != "" {
+		if source := &app.Spec.Sources[i]; isChartSource(source) {
 			return found(source, "Found the Helm chart source")
 		}
 	}

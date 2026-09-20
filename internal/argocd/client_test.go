@@ -852,8 +852,21 @@ func TestGetOCITags_AsksForTheArtifactOfTheChart(t *testing.T) {
 
 	// The tags carry no chart metadata, so they are passed on as they are.
 	assert.Equal(t, []string{"1.20.0", "1.21.0", "latest"}, tags)
-	assert.Equal(t, "/api/v1/repositories/ghcr.io%2Fmyorg%2Fcharts%2Fnginx/oci-tags", argo.lastPath(t))
+	assert.Equal(t, "/api/v1/repositories/oci:%2F%2Fghcr.io%2Fmyorg%2Fcharts%2Fnginx/oci-tags", argo.lastPath(t))
 	assert.Equal(t, "team-a", argo.lastQuery(t).Get("appProject"))
+}
+
+// TestGetOCITags_AsksForAChartNamedByItsURL checks the other way an Application may name an
+// OCI chart: a repository URL that is the artifact already, without a chart of its own.
+func TestGetOCITags_AsksForAChartNamedByItsURL(t *testing.T) {
+	argo := &fakeArgoCD{body: `{"tags":["1.21.0"]}`}
+	client := argo.client(t)
+
+	tags, err := client.GetOCITags(context.Background(), "oci://ghcr.io/myorg/charts/nginx", "", "team-a")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"1.21.0"}, tags)
+	assert.Equal(t, "/api/v1/repositories/oci:%2F%2Fghcr.io%2Fmyorg%2Fcharts%2Fnginx/oci-tags", argo.lastPath(t))
 }
 
 // TestGetOCITags_AsksArgoCDOncePerArtifact checks that the tags of an artifact are cached,

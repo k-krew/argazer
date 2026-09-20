@@ -8,6 +8,10 @@ import (
 	"strings"
 )
 
+// ociScheme is the scheme of an OCI reference, which an Application may name a chart with
+// and the oci-tags endpoint of ArgoCD expects.
+const ociScheme = "oci://"
+
 // listOCITags returns the tags ArgoCD reports for an OCI artifact, e.g.
 // "ghcr.io/myorg/charts/nginx". ArgoCD reaches the registry with the credentials it stores
 // for the repository, so Argazer never needs them itself.
@@ -16,7 +20,7 @@ import (
 // credentials are scoped to a project.
 func (r *restClient) listOCITags(ctx context.Context, artifact, project string) ([]string, error) {
 	var found refs
-	if err := r.getJSON(ctx, r.repositoryEndpoint(artifact, "oci-tags", project), &found); err != nil {
+	if err := r.getJSON(ctx, r.repositoryEndpoint(ociRepositoryURL(artifact), "oci-tags", project), &found); err != nil {
 		var statusErr *responseStatusError
 		if errors.As(err, &statusErr) && statusErr.status == http.StatusNotFound {
 			// The endpoint itself may be the thing that is missing: it was added in ArgoCD
@@ -47,7 +51,7 @@ func (r *restClient) listOCITags(ctx context.Context, artifact, project string) 
 // separately the way Helm does, so chart "nginx" of "ghcr.io/myorg/charts" lives in
 // "ghcr.io/myorg/charts/nginx".
 func ociArtifact(repoURL, chartName string) string {
-	if strings.HasPrefix(repoURL, "oci://") {
+	if strings.HasPrefix(strings.ToLower(repoURL), ociScheme) {
 		return strings.TrimSuffix(repoURL, "/")
 	}
 
@@ -58,4 +62,21 @@ func ociArtifact(repoURL, chartName string) string {
 	}
 
 	return artifact + "/" + chartName
+}
+
+// ociRepositoryURL is the repository URL the oci-tags endpoint takes for an artifact.
+//
+// The endpoint reads the registry out of the URL it is handed and needs the oci:// scheme to
+// find it: an artifact named as the bare registry path an Application may spell it as is
+// answered with "invalid registry" instead of its tags. The scheme is therefore added to an
+// artifact that goes without one.
+//
+// repositoryEndpoint escapes the result as a single path segment, the slashes and the colon
+// of the scheme included, which is what keeps it one path parameter of the request.
+func ociRepositoryURL(artifact string) string {
+	if strings.HasPrefix(strings.ToLower(artifact), ociScheme) {
+		return artifact
+	}
+
+	return ociScheme + artifact
 }
