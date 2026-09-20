@@ -330,9 +330,10 @@ func checkApplicationsConcurrently(ctx context.Context, apps []*argocd.Applicati
 
 	logger.WithField("concurrency", numWorkers).Debug("Starting concurrent application checks")
 
-	// Create channels for work distribution
+	// Create channels for work distribution. An application can be built from more than
+	// one chart, so a worker answers with every result of the application at once.
 	appChan := make(chan *argocd.Application, len(apps))
-	resultChan := make(chan ApplicationCheckResult, len(apps))
+	resultChan := make(chan []ApplicationCheckResult, len(apps))
 
 	// Start workers
 	var wg sync.WaitGroup
@@ -342,8 +343,7 @@ func checkApplicationsConcurrently(ctx context.Context, apps []*argocd.Applicati
 			defer wg.Done()
 			workerLogger := logger.WithField("worker_id", workerID)
 			for app := range appChan {
-				result := checkApplication(ctx, app, helmChecker, cfg, workerLogger)
-				resultChan <- result
+				resultChan <- checkApplication(ctx, app, helmChecker, cfg, workerLogger)
 			}
 		}(i)
 	}
@@ -360,16 +360,17 @@ func checkApplicationsConcurrently(ctx context.Context, apps []*argocd.Applicati
 
 	// Collect results
 	results := make([]ApplicationCheckResult, 0, len(apps))
-	for result := range resultChan {
-		results = append(results, result)
+	for appResults := range resultChan {
+		results = append(results, appResults...)
 	}
 
 	return results
 }
 
-// checkApplication checks a single application for Helm chart updates
-// Returns an ApplicationCheckResult with an empty AppName if the application should be skipped (non-Helm app)
-func checkApplication(ctx context.Context, app *argocd.Application, helmChecker *helm.Checker, cfg *config.Config, logger *logrus.Entry) ApplicationCheckResult {
+// checkApplication checks a single application for Helm chart updates. An Application can
+// be built from more than one chart, so it yields one result per chart it holds; a
+// non-Helm application yields none.
+func checkApplication(ctx context.Context, app *argocd.Application, helmChecker *helm.Checker, cfg *config.Config, logger *logrus.Entry) []ApplicationCheckResult {
 	appLogger := logger.WithFields(logrus.Fields{
 		"app_name": app.Metadata.Name,
 		"project":  app.Spec.Project,
@@ -377,15 +378,22 @@ func checkApplication(ctx context.Context, app *argocd.Application, helmChecker 
 
 	appLogger.Info("Processing application")
 
-	// Find Helm source
-	helmSource := findHelmSource(app, cfg.SourceName, appLogger)
-	if helmSource == nil {
+	helmSources := findHelmSources(app, cfg.SourceName, appLogger)
+	if len(helmSources) == 0 {
 		appLogger.Info("Application does not use Helm charts, skipping")
-		// Return empty result with no AppName - signals to skip this app
-		// This will be filtered out during result processing
-		return ApplicationCheckResult{}
+		return nil
 	}
 
+	results := make([]ApplicationCheckResult, 0, len(helmSources))
+	for _, helmSource := range helmSources {
+		results = append(results, checkSource(ctx, app, helmSource, helmChecker, cfg, appLogger))
+	}
+
+	return results
+}
+
+// checkSource checks one Helm source of an application for a newer chart version.
+func checkSource(ctx context.Context, app *argocd.Application, helmSource *argocd.ApplicationSource, helmChecker *helm.Checker, cfg *config.Config, logger *logrus.Entry) ApplicationCheckResult {
 	// Determine chart name: for Helm repos use Chart field, for Git repos use Path
 	chartName := helmSource.Chart
 	if chartName == "" && helmSource.Path != "" {
@@ -402,14 +410,14 @@ func checkApplication(ctx context.Context, app *argocd.Application, helmChecker 
 		ConstraintApplied: cfg.NotifyOn,
 	}
 
-	appLogger = appLogger.WithFields(logrus.Fields{
+	sourceLogger := logger.WithFields(logrus.Fields{
 		"chart_name":    chartName,
 		"chart_version": helmSource.TargetRevision,
 		"repo_url":      helmSource.RepoURL,
 		"constraint":    cfg.NotifyOn,
 	})
 
-	appLogger.Info("Found Helm-based application")
+	sourceLogger.Info("Found Helm-based application")
 
 	// Check for newer version with constraint
 	constraintResult, err := helmChecker.GetLatestVersionWithConstraint(
@@ -421,7 +429,7 @@ func checkApplication(ctx context.Context, app *argocd.Application, helmChecker 
 		cfg.NotifyOn,
 	)
 	if err != nil {
-		appLogger.WithError(err).Error("Failed to check Helm version")
+		sourceLogger.WithError(err).Error("Failed to check Helm version")
 		result.Error = err.Error()
 		return result
 	}
@@ -435,7 +443,7 @@ func checkApplication(ctx context.Context, app *argocd.Application, helmChecker 
 
 	switch {
 	case result.HasUpdate:
-		appLogger.WithFields(logrus.Fields{
+		sourceLogger.WithFields(logrus.Fields{
 			"current_version":               helmSource.TargetRevision,
 			"latest_version":                constraintResult.LatestVersion,
 			"latest_version_all":            constraintResult.LatestVersionAll,
@@ -443,18 +451,18 @@ func checkApplication(ctx context.Context, app *argocd.Application, helmChecker 
 			"update_type":                   constraintResult.UpdateType,
 		}).Warn("Update available!")
 	case constraintResult.UpdateType == helm.UpdateTypeInRange:
-		appLogger.WithFields(logrus.Fields{
+		sourceLogger.WithFields(logrus.Fields{
 			"current_version": helmSource.TargetRevision,
 			"latest_version":  constraintResult.LatestVersion,
 		}).Info("Latest version satisfies the target range, ArgoCD applies it automatically")
 	case constraintResult.HasUpdateOutsideConstraint:
-		appLogger.WithFields(logrus.Fields{
+		sourceLogger.WithFields(logrus.Fields{
 			"current_version":    helmSource.TargetRevision,
 			"latest_version_all": constraintResult.LatestVersionAll,
 			"constraint":         cfg.NotifyOn,
 		}).Info("Application is up to date within constraint, but updates exist outside constraint")
 	default:
-		appLogger.Info("Application is up to date")
+		sourceLogger.Info("Application is up to date")
 	}
 
 	return result
@@ -467,8 +475,10 @@ func requiresManualUpdate(updateType string) bool {
 	return updateType == helm.UpdateTypeOutOfRange || updateType == helm.UpdateTypePinned
 }
 
-// findHelmSource finds the Helm source in an ArgoCD application
-func findHelmSource(app *argocd.Application, sourceName string, logger *logrus.Entry) *argocd.ApplicationSource {
+// findHelmSources finds every Helm source of an ArgoCD application. A multi-source
+// Application can be built from several charts at once, a frontend and a backend chart
+// for instance, and each of them is a chart to be checked in its own right.
+func findHelmSources(app *argocd.Application, sourceName string, logger *logrus.Entry) []*argocd.ApplicationSource {
 	// A source that is a chart of its own, rather than a chart kept in a Git repository.
 	// ArgoCD lets an Application name an OCI chart in two ways: as a registry path plus a
 	// `chart`, or as a single `repoURL: oci://...` naming the chart already, which is why the
@@ -528,35 +538,32 @@ func findHelmSource(app *argocd.Application, sourceName string, logger *logrus.E
 
 	// Check if it's a single source application with Helm
 	if app.Spec.Source != nil && isHelmSource(app.Spec.Source, 0) {
-		return app.Spec.Source
+		return []*argocd.ApplicationSource{app.Spec.Source}
 	}
 
-	// Multi-source applications: a source picked by --source-name wins, then the source
-	// that is a Helm chart, and only then a Helm chart kept in a Git repository. Reaching
-	// for the chart before anything else is what keeps a Git source carrying Helm options,
-	// listed ahead of the chart, from being taken for the chart itself.
+	// --source-name narrows a multi-source Application down to the one source it names,
+	// which is the answer on its own. A name that matches nothing is no answer at all, and
+	// the Application is looked through as if the flag had not been given.
 	if sourceName != "" {
 		for i := range app.Spec.Sources {
 			source := &app.Spec.Sources[i]
 			if source.Name == sourceName && isHelmSource(source, i) {
-				return found(source, "Found matching Helm source by name")
+				return []*argocd.ApplicationSource{found(source, "Found matching Helm source by name")}
 			}
 		}
 	}
 
-	for i := range app.Spec.Sources {
-		if source := &app.Spec.Sources[i]; isChartSource(source) {
-			return found(source, "Found the Helm chart source")
-		}
-	}
-
+	// Every remaining Helm source is a chart of the Application, in the order the sources
+	// are listed. The values files are already left out by isHelmSource, which is what
+	// keeps the source holding them from being reported as a chart of its own.
+	var sources []*argocd.ApplicationSource
 	for i := range app.Spec.Sources {
 		if source := &app.Spec.Sources[i]; isHelmSource(source, i) {
-			return found(source, "Found a Helm chart in a Git repository")
+			sources = append(sources, found(source, "Found a Helm source"))
 		}
 	}
 
-	return nil
+	return sources
 }
 
 // scanResults holds statistics about the scan

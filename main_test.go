@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"testing"
 
 	"argazer/internal/argocd"
@@ -47,14 +48,14 @@ func TestSetupLogging(t *testing.T) {
 	})
 }
 
-func TestFindHelmSource(t *testing.T) {
+func TestFindHelmSources(t *testing.T) {
 	logger := logrus.NewEntry(logrus.New())
 
 	tests := []struct {
 		name       string
 		app        *argocd.Application
 		sourceName string
-		expected   bool
+		expected   bool // whether the application holds a Helm source at all
 	}{
 		{
 			name: "single source with helm chart",
@@ -280,21 +281,21 @@ func TestFindHelmSource(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := findHelmSource(tt.app, tt.sourceName, logger)
+			sources := findHelmSources(tt.app, tt.sourceName, logger)
 			if tt.expected {
-				assert.NotNil(t, result)
+				assert.NotEmpty(t, sources)
 			} else {
-				assert.Nil(t, result)
+				assert.Empty(t, sources)
 			}
 		})
 	}
 }
 
-// TestFindHelmSource_MultiSource checks which source of a multi-source application is
-// taken for the Helm chart. The pattern to get right is a chart alongside a Git repository
-// holding the values files: the chart has to win no matter which of the two is listed
+// TestFindHelmSources_MultiSource checks which sources of a multi-source application are
+// taken for Helm charts. The pattern to get right is a chart alongside a Git repository
+// holding the values files: the chart has to be found no matter which of the two is listed
 // first, and a source that is nothing but a `ref` must never be picked.
-func TestFindHelmSource_MultiSource(t *testing.T) {
+func TestFindHelmSources_MultiSource(t *testing.T) {
 	logger := logrus.NewEntry(logrus.New())
 
 	chart := argocd.ApplicationSource{
@@ -312,39 +313,41 @@ func TestFindHelmSource_MultiSource(t *testing.T) {
 		Helm:           &argocd.ApplicationSourceHelm{},
 	}
 
+	// expectedSource is a source the application is expected to be checked for, named by
+	// the repository it comes from and the chart it holds, if it names one.
+	type expectedSource struct {
+		repoURL string
+		chart   string
+	}
+
 	tests := []struct {
-		name            string
-		sources         []argocd.ApplicationSource
-		sourceTypes     []string // what ArgoCD recorded per source; empty means unprocessed
-		sourceName      string
-		expectedRepoURL string // empty means no Helm source is expected
-		expectedChart   string
+		name        string
+		sources     []argocd.ApplicationSource
+		sourceTypes []string // what ArgoCD recorded per source; empty means unprocessed
+		sourceName  string
+		expected    []expectedSource // in the order the sources are listed; empty means none
 	}{
 		{
-			name:            "values ref listed before the chart is ignored",
-			sources:         []argocd.ApplicationSource{valuesRef, chart},
-			expectedRepoURL: chart.RepoURL,
-			expectedChart:   "my-chart",
+			name:     "values ref listed before the chart is ignored",
+			sources:  []argocd.ApplicationSource{valuesRef, chart},
+			expected: []expectedSource{{repoURL: chart.RepoURL, chart: "my-chart"}},
 		},
 		{
-			name:            "values ref listed after the chart is ignored",
-			sources:         []argocd.ApplicationSource{chart, valuesRef},
-			expectedRepoURL: chart.RepoURL,
-			expectedChart:   "my-chart",
+			name:     "values ref listed after the chart is ignored",
+			sources:  []argocd.ApplicationSource{chart, valuesRef},
+			expected: []expectedSource{{repoURL: chart.RepoURL, chart: "my-chart"}},
 		},
 		{
-			name:            "a values ref cannot be picked by name",
-			sources:         []argocd.ApplicationSource{valuesRef, chart},
-			sourceName:      "values",
-			expectedRepoURL: chart.RepoURL,
-			expectedChart:   "my-chart",
+			name:       "a values ref cannot be picked by name",
+			sources:    []argocd.ApplicationSource{valuesRef, chart},
+			sourceName: "values",
+			expected:   []expectedSource{{repoURL: chart.RepoURL, chart: "my-chart"}},
 		},
 		{
-			name:            "the named chart wins over the other charts",
-			sources:         []argocd.ApplicationSource{chart, {Name: "other-chart", Chart: "other", RepoURL: "https://other.example.com"}},
-			sourceName:      "other-chart",
-			expectedRepoURL: "https://other.example.com",
-			expectedChart:   "other",
+			name:       "the named chart is the only one checked",
+			sources:    []argocd.ApplicationSource{chart, {Name: "other-chart", Chart: "other", RepoURL: "https://other.example.com"}},
+			sourceName: "other-chart",
+			expected:   []expectedSource{{repoURL: "https://other.example.com", chart: "other"}},
 		},
 		{
 			name: "a chart in a Git repository is found when there is no chart source",
@@ -352,28 +355,46 @@ func TestFindHelmSource_MultiSource(t *testing.T) {
 				valuesRef,
 				{Name: "git-chart", RepoURL: "https://github.com/example/charts.git", Path: "charts/my-chart", Helm: &argocd.ApplicationSourceHelm{}},
 			},
-			expectedRepoURL: "https://github.com/example/charts.git",
+			expected: []expectedSource{{repoURL: "https://github.com/example/charts.git"}},
 		},
 		{
-			name:            "an oci url without a chart field is the chart source",
-			sources:         []argocd.ApplicationSource{valuesRef, {Name: "oci-chart", RepoURL: "oci://ghcr.io/myorg/charts/nginx", TargetRevision: "1.2.3"}},
-			expectedRepoURL: "oci://ghcr.io/myorg/charts/nginx",
+			name:     "an oci url without a chart field is a chart source",
+			sources:  []argocd.ApplicationSource{valuesRef, {Name: "oci-chart", RepoURL: "oci://ghcr.io/myorg/charts/nginx", TargetRevision: "1.2.3"}},
+			expected: []expectedSource{{repoURL: "oci://ghcr.io/myorg/charts/nginx"}},
 		},
 		{
-			// The chart has to win over a Git source carrying Helm options no matter which
-			// of the two is listed first, the same as a chart named by a chart field does.
-			name: "an oci chart wins over a chart in a Git repository",
+			// An application built from a chart kept in Git and an OCI chart runs both of
+			// them, so both are checked rather than only the one that looks the most like
+			// a chart.
+			name: "an oci chart and a chart in a Git repository are both found",
 			sources: []argocd.ApplicationSource{
 				{Name: "git-chart", RepoURL: "https://github.com/example/charts.git", Path: "charts/my-chart", Helm: &argocd.ApplicationSourceHelm{}},
 				{Name: "oci-chart", RepoURL: "oci://ghcr.io/myorg/charts/nginx", TargetRevision: "1.2.3"},
 			},
-			expectedRepoURL: "oci://ghcr.io/myorg/charts/nginx",
+			expected: []expectedSource{
+				{repoURL: "https://github.com/example/charts.git"},
+				{repoURL: "oci://ghcr.io/myorg/charts/nginx"},
+			},
 		},
 		{
-			name:            "the named oci chart wins over the other charts",
-			sources:         []argocd.ApplicationSource{chart, {Name: "oci-chart", RepoURL: "oci://ghcr.io/myorg/charts/nginx"}},
-			sourceName:      "oci-chart",
-			expectedRepoURL: "oci://ghcr.io/myorg/charts/nginx",
+			// The frontend-and-backend pattern: two charts of the same repository, both of
+			// which have a version of their own to keep up with.
+			name: "two charts of the same repository are both found",
+			sources: []argocd.ApplicationSource{
+				{Name: "frontend", Chart: "frontend", RepoURL: "https://charts.example.com", TargetRevision: "1.0.0"},
+				{Name: "backend", Chart: "backend", RepoURL: "https://charts.example.com", TargetRevision: "2.0.0"},
+				valuesRef,
+			},
+			expected: []expectedSource{
+				{repoURL: "https://charts.example.com", chart: "frontend"},
+				{repoURL: "https://charts.example.com", chart: "backend"},
+			},
+		},
+		{
+			name:       "the named oci chart is the only one checked",
+			sources:    []argocd.ApplicationSource{chart, {Name: "oci-chart", RepoURL: "oci://ghcr.io/myorg/charts/nginx"}},
+			sourceName: "oci-chart",
+			expected:   []expectedSource{{repoURL: "oci://ghcr.io/myorg/charts/nginx"}},
 		},
 		{
 			name:    "nothing but a values ref is no Helm source",
@@ -394,8 +415,8 @@ func TestFindHelmSource_MultiSource(t *testing.T) {
 				valuesRef,
 				{Name: "git-chart", RepoURL: "https://github.com/example/charts.git", Path: "charts/my-chart", TargetRevision: "v1.2.3"},
 			},
-			sourceTypes:     []string{"Directory", "Helm"},
-			expectedRepoURL: "https://github.com/example/charts.git",
+			sourceTypes: []string{"Directory", "Helm"},
+			expected:    []expectedSource{{repoURL: "https://github.com/example/charts.git"}},
 		},
 		{
 			// The path of a Kustomize source looks just like the path of a chart, and it
@@ -408,13 +429,23 @@ func TestFindHelmSource_MultiSource(t *testing.T) {
 			sourceTypes: []string{"Kustomize", "Directory"},
 		},
 		{
+			// A Kustomize source alongside a chart must not be checked for chart versions
+			// just because the application holds a chart as well.
+			name: "a Kustomize source next to a chart is left out",
+			sources: []argocd.ApplicationSource{
+				{Name: "overlays", RepoURL: "https://github.com/example/repo.git", Path: "overlays/prod"},
+				chart,
+			},
+			sourceTypes: []string{"Kustomize", "Helm"},
+			expected:    []expectedSource{{repoURL: chart.RepoURL, chart: "my-chart"}},
+		},
+		{
 			// ArgoCD records a source type for the values files as well, which must not
 			// make them look like the chart.
-			name:            "a values ref recorded as Helm is still ignored",
-			sources:         []argocd.ApplicationSource{valuesRef, chart},
-			sourceTypes:     []string{"Helm", "Helm"},
-			expectedRepoURL: chart.RepoURL,
-			expectedChart:   "my-chart",
+			name:        "a values ref recorded as Helm is still ignored",
+			sources:     []argocd.ApplicationSource{valuesRef, chart},
+			sourceTypes: []string{"Helm", "Helm"},
+			expected:    []expectedSource{{repoURL: chart.RepoURL, chart: "my-chart"}},
 		},
 	}
 
@@ -426,17 +457,14 @@ func TestFindHelmSource_MultiSource(t *testing.T) {
 				Status:   argocd.ApplicationStatus{SourceTypes: tt.sourceTypes},
 			}
 
-			source := findHelmSource(app, tt.sourceName, logger)
+			sources := findHelmSources(app, tt.sourceName, logger)
 
-			if tt.expectedRepoURL == "" {
-				assert.Nil(t, source)
-				return
+			require.Len(t, sources, len(tt.expected))
+			for i, expected := range tt.expected {
+				assert.Equal(t, expected.repoURL, sources[i].RepoURL)
+				assert.Equal(t, expected.chart, sources[i].Chart)
+				assert.Empty(t, sources[i].Ref, "a source carrying only a ref holds no chart")
 			}
-
-			require.NotNil(t, source)
-			assert.Equal(t, tt.expectedRepoURL, source.RepoURL)
-			assert.Equal(t, tt.expectedChart, source.Chart)
-			assert.Empty(t, source.Ref, "a source carrying only a ref holds no chart")
 		})
 	}
 }
@@ -816,6 +844,59 @@ func TestCheckApplicationsConcurrently_NegativeConcurrency(t *testing.T) {
 	assert.Equal(t, 0, len(results))
 }
 
+// TestCheckApplicationsConcurrently_MultipleCharts checks that a scan collects every chart
+// of every application: an application built from two charts contributes two results, and
+// a non-Helm one none at all.
+func TestCheckApplicationsConcurrently_MultipleCharts(t *testing.T) {
+	logger := logrus.NewEntry(logrus.New())
+	versionSource := &stubChartVersions{versions: []string{"1.0.0", "2.0.0"}}
+	helmChecker, err := helm.NewChecker(versionSource, logger)
+	require.NoError(t, err)
+
+	apps := []*argocd.Application{
+		{
+			Metadata: argocd.ApplicationMetadata{Name: "two-charts"},
+			Spec: argocd.ApplicationSpec{
+				Project: "default",
+				Sources: []argocd.ApplicationSource{
+					{Name: "frontend", Chart: "frontend", RepoURL: "https://charts.example.com", TargetRevision: "1.0.0"},
+					{Name: "backend", Chart: "backend", RepoURL: "https://charts.example.com", TargetRevision: "1.0.0"},
+				},
+			},
+		},
+		{
+			Metadata: argocd.ApplicationMetadata{Name: "one-chart"},
+			Spec: argocd.ApplicationSpec{
+				Project: "default",
+				Source:  &argocd.ApplicationSource{Chart: "solo", RepoURL: "https://charts.example.com", TargetRevision: "1.0.0"},
+			},
+		},
+		{
+			Metadata: argocd.ApplicationMetadata{Name: "kustomize"},
+			Spec: argocd.ApplicationSpec{
+				Project: "default",
+				Source:  &argocd.ApplicationSource{RepoURL: "https://github.com/example/repo.git", Path: "overlays/prod"},
+			},
+			Status: argocd.ApplicationStatus{SourceType: "Kustomize"},
+		},
+	}
+
+	cfg := &config.Config{Concurrency: 2, NotifyOn: config.NotifyOnMajor}
+	results := checkApplicationsConcurrently(context.Background(), apps, helmChecker, cfg, logger)
+
+	require.Len(t, results, 3)
+
+	charts := make(map[string]string, len(results))
+	for _, result := range results {
+		charts[result.ChartName] = result.AppName
+	}
+	assert.Equal(t, map[string]string{
+		"frontend": "two-charts",
+		"backend":  "two-charts",
+		"solo":     "one-chart",
+	}, charts)
+}
+
 func TestApplicationCheckResult(t *testing.T) {
 	// Test struct creation
 	result := ApplicationCheckResult{
@@ -976,8 +1057,8 @@ func TestCheckApplication_NonHelmApp(t *testing.T) {
 		},
 	}
 
-	result := checkApplication(context.Background(), app, nil, cfg, logger)
-	assert.Equal(t, "", result.AppName, "Should return empty result for non-Helm app")
+	results := checkApplication(context.Background(), app, nil, cfg, logger)
+	assert.Empty(t, results, "Should return no results for non-Helm app")
 }
 
 // TestRequiresManualUpdate makes sure an update ArgoCD applies on its own (a newer version
@@ -1031,32 +1112,39 @@ func TestCheckApplication_MultiSourceWithHelm(t *testing.T) {
 	}
 
 	// Test that it finds the helm source correctly
-	helmSource := findHelmSource(app, cfg.SourceName, logger)
-	require.NotNil(t, helmSource)
-	assert.Equal(t, "my-chart", helmSource.Chart)
-	assert.Equal(t, "1.0.0", helmSource.TargetRevision)
+	helmSources := findHelmSources(app, cfg.SourceName, logger)
+	require.Len(t, helmSources, 1)
+	assert.Equal(t, "my-chart", helmSources[0].Chart)
+	assert.Equal(t, "1.0.0", helmSources[0].TargetRevision)
 }
 
 // stubChartVersions stands in for the ArgoCD client and records what it was asked about, so
-// a test can tell which source of an application the versions were looked up for.
+// a test can tell which source of an application the versions were looked up for. The
+// requests are guarded because the workers of a concurrent scan share the same client.
 type stubChartVersions struct {
 	versions []string
+
+	mu       sync.Mutex
 	requests []string
 }
 
-func (s *stubChartVersions) GetHelmChartVersions(_ context.Context, repoURL, chartName, _ string) ([]string, error) {
-	s.requests = append(s.requests, fmt.Sprintf("helm %s %s", repoURL, chartName))
+func (s *stubChartVersions) record(request string) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requests = append(s.requests, request)
 	return s.versions, nil
+}
+
+func (s *stubChartVersions) GetHelmChartVersions(_ context.Context, repoURL, chartName, _ string) ([]string, error) {
+	return s.record(fmt.Sprintf("helm %s %s", repoURL, chartName))
 }
 
 func (s *stubChartVersions) GetOCITags(_ context.Context, repoURL, chartName, _ string) ([]string, error) {
-	s.requests = append(s.requests, fmt.Sprintf("oci %s %s", repoURL, chartName))
-	return s.versions, nil
+	return s.record(fmt.Sprintf("oci %s %s", repoURL, chartName))
 }
 
 func (s *stubChartVersions) GetGitTags(_ context.Context, repoURL, _ string) ([]string, error) {
-	s.requests = append(s.requests, fmt.Sprintf("git %s", repoURL))
-	return s.versions, nil
+	return s.record(fmt.Sprintf("git %s", repoURL))
 }
 
 // TestCheckApplication_MultiSourceValuesRef checks that an application whose values live in
@@ -1090,8 +1178,10 @@ func TestCheckApplication_MultiSourceValuesRef(t *testing.T) {
 	}
 
 	cfg := &config.Config{NotifyOn: config.NotifyOnMajor}
-	result := checkApplication(context.Background(), app, helmChecker, cfg, logger)
+	results := checkApplication(context.Background(), app, helmChecker, cfg, logger)
 
+	require.Len(t, results, 1)
+	result := results[0]
 	assert.Equal(t, "multi-source-app", result.AppName)
 	assert.Equal(t, "my-chart", result.ChartName)
 	assert.Equal(t, "https://charts.example.com", result.RepoURL)
@@ -1100,6 +1190,94 @@ func TestCheckApplication_MultiSourceValuesRef(t *testing.T) {
 	assert.Empty(t, result.Error)
 	assert.Equal(t, []string{"helm https://charts.example.com my-chart"}, versionSource.requests,
 		"only the chart source should be looked up")
+}
+
+// TestCheckApplication_MultipleCharts checks an application built from two charts: both of
+// them are checked against their own repository and reported on their own, so an update to
+// either one is not hidden behind the other.
+func TestCheckApplication_MultipleCharts(t *testing.T) {
+	logger := logrus.NewEntry(logrus.New())
+	versionSource := &stubChartVersions{versions: []string{"1.0.0", "1.1.0", "2.0.0"}}
+	helmChecker, err := helm.NewChecker(versionSource, logger)
+	require.NoError(t, err)
+
+	app := &argocd.Application{
+		Metadata: argocd.ApplicationMetadata{Name: "frontend-and-backend"},
+		Spec: argocd.ApplicationSpec{
+			Project: "default",
+			Sources: []argocd.ApplicationSource{
+				{
+					RepoURL:        "https://github.com/example/values.git",
+					TargetRevision: "main",
+					Ref:            "values",
+				},
+				{
+					Name:           "frontend",
+					Chart:          "frontend",
+					RepoURL:        "https://charts.example.com",
+					TargetRevision: "1.0.0",
+				},
+				{
+					Name:           "backend",
+					Chart:          "backend",
+					RepoURL:        "https://charts.example.com",
+					TargetRevision: "2.0.0",
+				},
+			},
+		},
+	}
+
+	cfg := &config.Config{NotifyOn: config.NotifyOnMajor}
+	results := checkApplication(context.Background(), app, helmChecker, cfg, logger)
+
+	require.Len(t, results, 2, "both charts of the application are reported")
+
+	frontend := results[0]
+	assert.Equal(t, "frontend-and-backend", frontend.AppName)
+	assert.Equal(t, "frontend", frontend.ChartName)
+	assert.Equal(t, "1.0.0", frontend.CurrentVersion)
+	assert.Equal(t, "2.0.0", frontend.LatestVersion)
+	assert.True(t, frontend.HasUpdate)
+	assert.Empty(t, frontend.Error)
+
+	backend := results[1]
+	assert.Equal(t, "frontend-and-backend", backend.AppName)
+	assert.Equal(t, "backend", backend.ChartName)
+	assert.Equal(t, "2.0.0", backend.CurrentVersion)
+	assert.Equal(t, "2.0.0", backend.LatestVersion)
+	assert.False(t, backend.HasUpdate, "the backend chart is already on the newest version")
+
+	assert.Equal(t, []string{
+		"helm https://charts.example.com frontend",
+		"helm https://charts.example.com backend",
+	}, versionSource.requests, "each chart is looked up once, the values source not at all")
+}
+
+// TestCheckApplication_MultipleChartsWithSourceName checks that --source-name still narrows
+// a multi-chart application down to the single chart it names.
+func TestCheckApplication_MultipleChartsWithSourceName(t *testing.T) {
+	logger := logrus.NewEntry(logrus.New())
+	versionSource := &stubChartVersions{versions: []string{"1.0.0", "2.0.0"}}
+	helmChecker, err := helm.NewChecker(versionSource, logger)
+	require.NoError(t, err)
+
+	app := &argocd.Application{
+		Metadata: argocd.ApplicationMetadata{Name: "frontend-and-backend"},
+		Spec: argocd.ApplicationSpec{
+			Project: "default",
+			Sources: []argocd.ApplicationSource{
+				{Name: "frontend", Chart: "frontend", RepoURL: "https://charts.example.com", TargetRevision: "1.0.0"},
+				{Name: "backend", Chart: "backend", RepoURL: "https://charts.example.com", TargetRevision: "1.0.0"},
+			},
+		},
+	}
+
+	cfg := &config.Config{NotifyOn: config.NotifyOnMajor, SourceName: "backend"}
+	results := checkApplication(context.Background(), app, helmChecker, cfg, logger)
+
+	require.Len(t, results, 1)
+	assert.Equal(t, "backend", results[0].ChartName)
+	assert.Equal(t, []string{"helm https://charts.example.com backend"}, versionSource.requests)
 }
 
 // TestCheckApplication_GitChartSource checks an application whose chart is a directory of a
@@ -1125,8 +1303,10 @@ func TestCheckApplication_GitChartSource(t *testing.T) {
 	}
 
 	cfg := &config.Config{NotifyOn: config.NotifyOnMajor}
-	result := checkApplication(context.Background(), app, helmChecker, cfg, logger)
+	results := checkApplication(context.Background(), app, helmChecker, cfg, logger)
 
+	require.Len(t, results, 1)
+	result := results[0]
 	assert.Equal(t, "git-chart-app", result.AppName)
 	assert.Equal(t, "charts/my-chart", result.ChartName, "the directory of the chart stands in for its name")
 	assert.Equal(t, "https://github.com/example/charts.git", result.RepoURL)
@@ -1161,9 +1341,9 @@ func TestCheckApplication_KustomizeApp(t *testing.T) {
 	}
 
 	cfg := &config.Config{NotifyOn: config.NotifyOnMajor}
-	result := checkApplication(context.Background(), app, helmChecker, cfg, logger)
+	results := checkApplication(context.Background(), app, helmChecker, cfg, logger)
 
-	assert.Empty(t, result.AppName, "a Kustomize application is skipped")
+	assert.Empty(t, results, "a Kustomize application is skipped")
 	assert.Empty(t, versionSource.requests, "nothing is looked up for a Kustomize application")
 }
 
