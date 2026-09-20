@@ -5,10 +5,15 @@ package argocd
 // more, and parsing just this much is what keeps the ArgoCD SDK, along with the gRPC,
 // Kubernetes and Helm libraries it pulls in, out of the binary.
 
+// SourceTypeHelm is what ArgoCD records for a source it renders with Helm. The other
+// values it uses are Kustomize, Directory and Plugin, none of which hold a chart.
+const SourceTypeHelm = "Helm"
+
 // Application is an ArgoCD Application as far as Argazer is concerned.
 type Application struct {
 	Metadata ApplicationMetadata `json:"metadata"`
 	Spec     ApplicationSpec     `json:"spec"`
+	Status   ApplicationStatus   `json:"status"`
 }
 
 // ApplicationMetadata is the Kubernetes object metadata of an Application.
@@ -26,6 +31,16 @@ type ApplicationSpec struct {
 	// Application carries one or the other, never both.
 	Source  *ApplicationSource  `json:"source,omitempty"`
 	Sources []ApplicationSource `json:"sources,omitempty"`
+}
+
+// ApplicationStatus is what ArgoCD worked out about an Application while processing it.
+type ApplicationStatus struct {
+	// SourceType is the tool ArgoCD renders a single-source Application with, SourceTypes
+	// holds one entry per source of a multi-source one, in the order the sources are
+	// listed. Both stay empty until ArgoCD has processed the Application for the first
+	// time, so neither can be relied upon to be there.
+	SourceType  string   `json:"sourceType,omitempty"`
+	SourceTypes []string `json:"sourceTypes,omitempty"`
 }
 
 // ApplicationSource is one place an Application takes manifests from.

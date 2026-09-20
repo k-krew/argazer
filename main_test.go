@@ -71,6 +71,24 @@ func TestFindHelmSource(t *testing.T) {
 			expected:   true,
 		},
 		{
+			// A chart kept in a Git repository names the directory it lives in instead of
+			// a chart, so nothing but the source type ArgoCD recorded tells it apart from
+			// the manifests of a Kustomize application.
+			name: "single source with a chart in Git declared by ArgoCD",
+			app: &argocd.Application{
+				Spec: argocd.ApplicationSpec{
+					Source: &argocd.ApplicationSource{
+						RepoURL:        "https://github.com/example/charts.git",
+						TargetRevision: "1.0.0",
+						Path:           "charts/my-chart",
+					},
+				},
+				Status: argocd.ApplicationStatus{SourceType: "Helm"},
+			},
+			sourceName: "",
+			expected:   true,
+		},
+		{
 			name: "single source without helm chart",
 			app: &argocd.Application{
 				Spec: argocd.ApplicationSpec{
@@ -83,6 +101,38 @@ func TestFindHelmSource(t *testing.T) {
 			},
 			sourceName: "",
 			expected:   false,
+		},
+		{
+			name: "single source rendered with Kustomize",
+			app: &argocd.Application{
+				Spec: argocd.ApplicationSpec{
+					Source: &argocd.ApplicationSource{
+						RepoURL:        "https://github.com/example/repo",
+						TargetRevision: "main",
+						Path:           "overlays/prod",
+					},
+				},
+				Status: argocd.ApplicationStatus{SourceType: "Kustomize"},
+			},
+			sourceName: "",
+			expected:   false,
+		},
+		{
+			// Helm options are what is left to go by while ArgoCD has not processed the
+			// application and filled its status in.
+			name: "single source with helm options and no status",
+			app: &argocd.Application{
+				Spec: argocd.ApplicationSpec{
+					Source: &argocd.ApplicationSource{
+						RepoURL:        "https://github.com/example/charts.git",
+						TargetRevision: "1.0.0",
+						Path:           "charts/my-chart",
+						Helm:           &argocd.ApplicationSourceHelm{},
+					},
+				},
+			},
+			sourceName: "",
+			expected:   true,
 		},
 		{
 			name: "multi-source with helm chart",
@@ -164,6 +214,52 @@ func TestFindHelmSource(t *testing.T) {
 			expected:   false,
 		},
 		{
+			// The source types are listed in the order of the sources, so the Helm entry
+			// belongs to the second one.
+			name: "multi-source with a chart in Git declared by ArgoCD",
+			app: &argocd.Application{
+				Spec: argocd.ApplicationSpec{
+					Sources: []argocd.ApplicationSource{
+						{
+							RepoURL:        "https://github.com/example/values.git",
+							TargetRevision: "main",
+							Ref:            "values",
+						},
+						{
+							RepoURL:        "https://github.com/example/charts.git",
+							TargetRevision: "1.0.0",
+							Path:           "charts/my-chart",
+						},
+					},
+				},
+				Status: argocd.ApplicationStatus{SourceTypes: []string{"Directory", "Helm"}},
+			},
+			sourceName: "",
+			expected:   true,
+		},
+		{
+			name: "multi-source rendered with Kustomize",
+			app: &argocd.Application{
+				Spec: argocd.ApplicationSpec{
+					Sources: []argocd.ApplicationSource{
+						{
+							RepoURL:        "https://github.com/example/base.git",
+							TargetRevision: "main",
+							Path:           "base",
+						},
+						{
+							RepoURL:        "https://github.com/example/overlays.git",
+							TargetRevision: "main",
+							Path:           "overlays/prod",
+						},
+					},
+				},
+				Status: argocd.ApplicationStatus{SourceTypes: []string{"Kustomize", "Kustomize"}},
+			},
+			sourceName: "",
+			expected:   false,
+		},
+		{
 			name: "multi-source named source not found",
 			app: &argocd.Application{
 				Spec: argocd.ApplicationSpec{
@@ -219,6 +315,7 @@ func TestFindHelmSource_MultiSource(t *testing.T) {
 	tests := []struct {
 		name            string
 		sources         []argocd.ApplicationSource
+		sourceTypes     []string // what ArgoCD recorded per source; empty means unprocessed
 		sourceName      string
 		expectedRepoURL string // empty means no Helm source is expected
 		expectedChart   string
@@ -289,6 +386,36 @@ func TestFindHelmSource_MultiSource(t *testing.T) {
 				valuesRef,
 			},
 		},
+		{
+			// A chart kept in Git needs no Helm options of its own: once ArgoCD has
+			// processed the application, the source type is what names the chart.
+			name: "a chart in a Git repository is found from the source types",
+			sources: []argocd.ApplicationSource{
+				valuesRef,
+				{Name: "git-chart", RepoURL: "https://github.com/example/charts.git", Path: "charts/my-chart", TargetRevision: "v1.2.3"},
+			},
+			sourceTypes:     []string{"Directory", "Helm"},
+			expectedRepoURL: "https://github.com/example/charts.git",
+		},
+		{
+			// The path of a Kustomize source looks just like the path of a chart, and it
+			// is the source type that keeps it from being checked for chart versions.
+			name: "a Kustomize source is no Helm source",
+			sources: []argocd.ApplicationSource{
+				{Name: "overlays", RepoURL: "https://github.com/example/repo.git", Path: "overlays/prod"},
+				valuesRef,
+			},
+			sourceTypes: []string{"Kustomize", "Directory"},
+		},
+		{
+			// ArgoCD records a source type for the values files as well, which must not
+			// make them look like the chart.
+			name:            "a values ref recorded as Helm is still ignored",
+			sources:         []argocd.ApplicationSource{valuesRef, chart},
+			sourceTypes:     []string{"Helm", "Helm"},
+			expectedRepoURL: chart.RepoURL,
+			expectedChart:   "my-chart",
+		},
 	}
 
 	for _, tt := range tests {
@@ -296,6 +423,7 @@ func TestFindHelmSource_MultiSource(t *testing.T) {
 			app := &argocd.Application{
 				Metadata: argocd.ApplicationMetadata{Name: "multi-source-app"},
 				Spec:     argocd.ApplicationSpec{Sources: tt.sources},
+				Status:   argocd.ApplicationStatus{SourceTypes: tt.sourceTypes},
 			}
 
 			source := findHelmSource(app, tt.sourceName, logger)
@@ -972,6 +1100,71 @@ func TestCheckApplication_MultiSourceValuesRef(t *testing.T) {
 	assert.Empty(t, result.Error)
 	assert.Equal(t, []string{"helm https://charts.example.com my-chart"}, versionSource.requests,
 		"only the chart source should be looked up")
+}
+
+// TestCheckApplication_GitChartSource checks an application whose chart is a directory of a
+// Git repository: the directory stands in for the chart name, and the versions come from the
+// tags of the repository rather than from a chart list.
+func TestCheckApplication_GitChartSource(t *testing.T) {
+	logger := logrus.NewEntry(logrus.New())
+	versionSource := &stubChartVersions{versions: []string{"my-chart-1.0.0", "my-chart-1.1.0", "other-chart-3.0.0"}}
+	helmChecker, err := helm.NewChecker(versionSource, logger)
+	require.NoError(t, err)
+
+	app := &argocd.Application{
+		Metadata: argocd.ApplicationMetadata{Name: "git-chart-app"},
+		Spec: argocd.ApplicationSpec{
+			Project: "default",
+			Source: &argocd.ApplicationSource{
+				RepoURL:        "https://github.com/example/charts.git",
+				TargetRevision: "1.0.0",
+				Path:           "charts/my-chart",
+			},
+		},
+		Status: argocd.ApplicationStatus{SourceType: "Helm"},
+	}
+
+	cfg := &config.Config{NotifyOn: config.NotifyOnMajor}
+	result := checkApplication(context.Background(), app, helmChecker, cfg, logger)
+
+	assert.Equal(t, "git-chart-app", result.AppName)
+	assert.Equal(t, "charts/my-chart", result.ChartName, "the directory of the chart stands in for its name")
+	assert.Equal(t, "https://github.com/example/charts.git", result.RepoURL)
+	assert.Equal(t, "1.0.0", result.CurrentVersion)
+	assert.Equal(t, "1.1.0", result.LatestVersion, "the tags of the neighbouring chart are left out")
+	assert.True(t, result.HasUpdate)
+	assert.Empty(t, result.Error)
+	assert.Equal(t, []string{"git https://github.com/example/charts.git"}, versionSource.requests,
+		"the versions of a chart in Git come from the tags of the repository")
+}
+
+// TestCheckApplication_KustomizeApp checks that a Kustomize application, which names a path
+// just like a chart kept in Git does, is skipped rather than looked up and reported as a
+// chart that could not be found.
+func TestCheckApplication_KustomizeApp(t *testing.T) {
+	logger := logrus.NewEntry(logrus.New())
+	versionSource := &stubChartVersions{}
+	helmChecker, err := helm.NewChecker(versionSource, logger)
+	require.NoError(t, err)
+
+	app := &argocd.Application{
+		Metadata: argocd.ApplicationMetadata{Name: "kustomize-app"},
+		Spec: argocd.ApplicationSpec{
+			Project: "default",
+			Source: &argocd.ApplicationSource{
+				RepoURL:        "https://github.com/example/repo.git",
+				TargetRevision: "main",
+				Path:           "overlays/prod",
+			},
+		},
+		Status: argocd.ApplicationStatus{SourceType: "Kustomize"},
+	}
+
+	cfg := &config.Config{NotifyOn: config.NotifyOnMajor}
+	result := checkApplication(context.Background(), app, helmChecker, cfg, logger)
+
+	assert.Empty(t, result.AppName, "a Kustomize application is skipped")
+	assert.Empty(t, versionSource.requests, "nothing is looked up for a Kustomize application")
 }
 
 func TestSendNotifications_MultipleMessages(t *testing.T) {

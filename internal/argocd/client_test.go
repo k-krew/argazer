@@ -312,7 +312,7 @@ const applicationsAnswer = `{
           "targetRevision": "1.21.0"
         }
       },
-      "status": {"sync": {"status": "Synced"}, "health": {"status": "Healthy"}}
+      "status": {"sync": {"status": "Synced"}, "health": {"status": "Healthy"}, "sourceType": "Helm"}
     },
     {
       "metadata": {"name": "redis-app", "namespace": "argocd"},
@@ -333,7 +333,8 @@ const applicationsAnswer = `{
             "helm": {"valueFiles": ["$values/redis.yaml"]}
           }
         ]
-      }
+      },
+      "status": {"sourceTypes": ["Directory", "Helm"]}
     }
   ]
 }`
@@ -359,19 +360,25 @@ func TestListApplications_ReadsTheFieldsArgazerNeeds(t *testing.T) {
 	assert.Equal(t, "https://charts.example.com", nginx.Spec.Source.RepoURL)
 	assert.Equal(t, "nginx", nginx.Spec.Source.Chart)
 	assert.Equal(t, "1.21.0", nginx.Spec.Source.TargetRevision)
+	// The source type is what tells a chart kept in a Git repository from the manifests of
+	// a Kustomize or Directory application, both of which name a path just the same.
+	assert.Equal(t, SourceTypeHelm, nginx.Status.SourceType)
+	assert.Empty(t, nginx.Status.SourceTypes)
 
 	redis := apps[1]
 	assert.Equal(t, "redis-app", redis.Metadata.Name)
 	assert.Equal(t, "team-b", redis.Spec.Project)
 	assert.Nil(t, redis.Spec.Source)
 	require.Len(t, redis.Spec.Sources, 2)
+	// A multi-source application is given one source type per source, in the order the
+	// sources are listed.
+	assert.Empty(t, redis.Status.SourceType)
+	assert.Equal(t, []string{"Directory", SourceTypeHelm}, redis.Status.SourceTypes)
 
 	values := redis.Spec.Sources[0]
 	assert.Equal(t, "values", values.Name)
 	assert.Equal(t, "values", values.Path)
 	assert.Empty(t, values.Chart)
-	// Only a source with Helm options of its own is a Helm source, which is what tells a
-	// chart in a Git repository from plain manifests.
 	assert.Nil(t, values.Helm)
 
 	chart := redis.Spec.Sources[1]

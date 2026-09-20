@@ -477,24 +477,43 @@ func findHelmSource(app *argocd.Application, sourceName string, logger *logrus.E
 		return source.Chart != "" || strings.HasPrefix(strings.ToLower(source.RepoURL), "oci://")
 	}
 
-	// Helper function to check if a source is Helm-based
-	isHelmSource := func(source *argocd.ApplicationSource) bool {
-		// Check if it's a chart source (a Helm repository with a chart, or an OCI chart)
-		if isChartSource(source) {
-			return true
-		}
-		// Check if it's a Git repository with Helm (has Helm parameters)
-		if source.Helm != nil {
-			return true
-		}
-		return false
-	}
-
 	// A source that carries a ref and no chart of its own holds the values files the other
 	// sources point at (the `ref: values` pattern). ArgoCD renders nothing from it, and it
 	// has no chart version to look up, so it is never the Helm source.
 	isValuesRef := func(source *argocd.ApplicationSource) bool {
 		return source.Ref != "" && !isChartSource(source)
+	}
+
+	// declaredSourceType returns the tool ArgoCD says it renders the source at index with,
+	// and whether it says anything at all. A single-source Application carries one
+	// sourceType, a multi-source one a sourceTypes holding an entry per source in the order
+	// the sources are listed; an Application ArgoCD has not processed yet carries neither.
+	declaredSourceType := func(index int) (string, bool) {
+		if len(app.Spec.Sources) > 0 {
+			if index >= len(app.Status.SourceTypes) {
+				return "", false
+			}
+			return app.Status.SourceTypes[index], app.Status.SourceTypes[index] != ""
+		}
+		return app.Status.SourceType, app.Status.SourceType != ""
+	}
+
+	// Helper function to check if a source is Helm-based. A chart kept in a Git repository
+	// names a `path` and no chart, which is exactly what a Kustomize or plain-manifest
+	// source looks like, so the path on its own settles nothing. ArgoCD knows which tool it
+	// renders each source with and says so in the status, which is the answer whenever it
+	// is there; until then the Helm options on the source are the only hint left.
+	isHelmSource := func(source *argocd.ApplicationSource, index int) bool {
+		if isValuesRef(source) {
+			return false
+		}
+		if isChartSource(source) {
+			return true
+		}
+		if sourceType, ok := declaredSourceType(index); ok {
+			return sourceType == argocd.SourceTypeHelm
+		}
+		return source.Helm != nil
 	}
 
 	found := func(source *argocd.ApplicationSource, message string) *argocd.ApplicationSource {
@@ -508,7 +527,7 @@ func findHelmSource(app *argocd.Application, sourceName string, logger *logrus.E
 	}
 
 	// Check if it's a single source application with Helm
-	if app.Spec.Source != nil && isHelmSource(app.Spec.Source) {
+	if app.Spec.Source != nil && isHelmSource(app.Spec.Source, 0) {
 		return app.Spec.Source
 	}
 
@@ -519,7 +538,7 @@ func findHelmSource(app *argocd.Application, sourceName string, logger *logrus.E
 	if sourceName != "" {
 		for i := range app.Spec.Sources {
 			source := &app.Spec.Sources[i]
-			if source.Name == sourceName && isHelmSource(source) && !isValuesRef(source) {
+			if source.Name == sourceName && isHelmSource(source, i) {
 				return found(source, "Found matching Helm source by name")
 			}
 		}
@@ -532,8 +551,7 @@ func findHelmSource(app *argocd.Application, sourceName string, logger *logrus.E
 	}
 
 	for i := range app.Spec.Sources {
-		source := &app.Spec.Sources[i]
-		if isHelmSource(source) && !isValuesRef(source) {
+		if source := &app.Spec.Sources[i]; isHelmSource(source, i) {
 			return found(source, "Found a Helm chart in a Git repository")
 		}
 	}
