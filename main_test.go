@@ -391,6 +391,20 @@ func TestFindHelmSources_MultiSource(t *testing.T) {
 			},
 		},
 		{
+			// The application reported from a live cluster: two charts of one repository,
+			// no values source, and a source type recorded for each of them.
+			name: "two charts recorded as Helm are both found",
+			sources: []argocd.ApplicationSource{
+				{Chart: "mariadb", RepoURL: "https://charts.bitnami.com/bitnami", TargetRevision: "12.0.0"},
+				{Chart: "redis", RepoURL: "https://charts.bitnami.com/bitnami", TargetRevision: "18.0.0"},
+			},
+			sourceTypes: []string{"Helm", "Helm"},
+			expected: []expectedSource{
+				{repoURL: "https://charts.bitnami.com/bitnami", chart: "mariadb"},
+				{repoURL: "https://charts.bitnami.com/bitnami", chart: "redis"},
+			},
+		},
+		{
 			name:       "the named oci chart is the only one checked",
 			sources:    []argocd.ApplicationSource{chart, {Name: "oci-chart", RepoURL: "oci://ghcr.io/myorg/charts/nginx"}},
 			sourceName: "oci-chart",
