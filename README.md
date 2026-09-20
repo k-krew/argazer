@@ -160,7 +160,7 @@ Sources, in order of precedence: CLI flags → environment variables (`AG_` pref
 | `--notify-on` | `notify_on` / `AG_NOTIFY_ON` | `major` | Widest in-policy bump for a pinned revision: `major`, `minor`, `patch` |
 | `--fail-on` | `fail_on` / `AG_FAIL_ON` | `none` | Severity that makes the run exit `2`: `none`, `any`, `patch`, `minor`, `major` |
 | `--output-format`, `-o` | `output_format` / `AG_OUTPUT_FORMAT` | `table` | `table`, `json`, `markdown` |
-| `--verbosity`, `-v` | `verbosity` / `AG_VERBOSITY` | `normal` | `normal` (info), `full` (debug), `off` (results only) |
+| `--verbosity`, `-v` | `verbosity` / `AG_VERBOSITY` | `off` | `normal` (info), `full` (debug), `off` (results only) |
 | `--log-format`, `-l` | `log_format` / `AG_LOG_FORMAT` | `json` | `json`, `text` |
 | `--concurrency` | `concurrency` / `AG_CONCURRENCY` | `10` | Applications checked in parallel |
 | `--notification-channel` | `notification_channel` / `AG_NOTIFICATION_CHANNEL` | — | `slack`, `webhook`, or empty for console only |

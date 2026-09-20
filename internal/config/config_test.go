@@ -427,7 +427,7 @@ func TestLoad_Defaults(t *testing.T) {
 	require.NotNil(t, cfg)
 
 	// Check defaults
-	assert.Equal(t, "normal", cfg.Verbosity)
+	assert.Equal(t, "off", cfg.Verbosity)
 	assert.False(t, cfg.ArgocdInsecure)
 	assert.Equal(t, 10, cfg.Concurrency)
 	assert.Equal(t, "chart-repo", cfg.SourceName)

@@ -108,7 +108,7 @@ func Load() (*Config, error) {
 // setDefaults sets default values for all configuration fields
 func setDefaults() {
 	// Boolean and numeric defaults
-	viper.SetDefault("verbosity", VerbosityNormal)
+	viper.SetDefault("verbosity", VerbosityOff)
 	viper.SetDefault("argocd_insecure", false)
 	viper.SetDefault("concurrency", 10)
 

@@ -71,7 +71,7 @@ Exit codes: 0 - nothing to report, 1 - the scan could not be completed, 2 - upda
 	rootCmd.Flags().String("notify-on", config.NotifyOnMajor, "Report updates up to: 'major' (all), 'minor' (same major), 'patch' (same major.minor)")
 	rootCmd.Flags().StringP("output-format", "o", "table", "Output format: 'table', 'json', or 'markdown'")
 	rootCmd.Flags().StringP("log-format", "l", "json", "Log format: 'json' or 'text'")
-	rootCmd.Flags().StringP("verbosity", "v", "normal", "Verbosity level: 'full' (all logs), 'normal' (necessary logs), 'off' (only results)")
+	rootCmd.Flags().StringP("verbosity", "v", "off", "Verbosity level: 'full' (all logs), 'normal' (necessary logs), 'off' (only results)")
 	rootCmd.Flags().String("fail-on", config.FailOnNone, "Exit with code 2 when updates of this severity or higher are found: 'none' (never), 'any', 'patch', 'minor', 'major'")
 
 	// Bind flags to viper

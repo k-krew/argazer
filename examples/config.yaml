@@ -53,7 +53,7 @@ slack_webhook: "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
 webhook_url: "https://your-webhook-endpoint.example.com/notify"
 
 # General Settings
-verbosity: "normal"  # "normal" | "full" | "off"
+verbosity: "off"  # "normal" | "full" | "off"
 source_name: "chart-repo"  # For multi-source applications
 concurrency: 10  # Number of concurrent workers for checking applications
 
